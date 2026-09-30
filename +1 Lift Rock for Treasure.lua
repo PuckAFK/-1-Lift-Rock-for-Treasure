@@ -1,0 +1,2873 @@
+
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+if game.PlaceId ~= 102555956950143 then
+    warn("[PuckAFK Lift Rock] Wrong place. Expected 102555956950143, got " .. tostring(game.PlaceId))
+    return
+end
+
+local ENV = (getgenv and getgenv()) or _G
+local previousInstance = ENV.PuckAFK_LiftRock
+if previousInstance then
+    -- v1.3.0 never reached its bootstrap, so its table can be left in getgenv()
+    -- even though no workers/UI were started. Discard that known dormant build
+    -- directly so upgrading does not print a misleading "Unloaded" warning.
+    local dormantBroken130 = tostring(previousInstance.Version or "") == "1.3.0"
+        and (not previousInstance.UI or previousInstance.UI.Window == nil)
+        and (type(previousInstance.Connections) ~= "table" or #previousInstance.Connections == 0)
+        and (type(previousInstance.Threads) ~= "table" or #previousInstance.Threads == 0)
+
+    if dormantBroken130 then
+        previousInstance.Alive = false
+        if type(previousInstance.Settings) == "table" then
+            previousInstance.Settings.Enabled = false
+        end
+        ENV.PuckAFK_LiftRock = nil
+    elseif type(previousInstance.Shutdown) == "function" then
+        pcall(function()
+            previousInstance:Shutdown(true)
+        end)
+    else
+        ENV.PuckAFK_LiftRock = nil
+    end
+end
+
+local P = {
+    Version = "1.6.1",
+    Alive = true,
+    Connections = {},
+    Threads = {},
+    Status = "Loading game data...",
+    Phase = "BOOT",
+    TargetStage = 1,
+    TrainingTarget = nil,
+    LastError = nil,
+    LastEconomyAt = 0,
+    LastSpecialSync = 0,
+    LastFreeClaim = 0,
+    UI = {},
+    Run = {
+        Cleared = {},
+        Rewards = {},
+        Progress = {},
+        Session = nil,
+        Specials = {},
+        SpecialRevisions = {},
+        Synced = false,
+        LastReset = 0,
+        LastBank = 0,
+        LastFeedback = 0,
+    },
+    Route = {
+        GameROIStage = 0,
+        CashPerSecond = 0,
+        ExpectedItemValue = 0,
+        TripSeconds = 0,
+    },
+    Navigation = {
+        Token = 0,
+        Destination = nil,
+        LastResult = "Idle",
+        Repaths = 0,
+        Busy = false,
+        Waypoint = 0,
+        LastProgressAt = 0,
+        LastDistance = 0,
+    },
+    Requirements = {
+        Kind = "Scanning",
+        Name = "Scanning progression",
+        Detail = "",
+        Cost = 0,
+        MissingCash = 0,
+        TargetPower = 0,
+        DesiredBackpack = 0,
+    },
+}
+ENV.PuckAFK_LiftRock = P
+
+P.Settings = {
+    Enabled = true,
+    AutoTrain = true,
+    AutoLift = true,
+    AutoCollect = true,
+    AutoBank = true,
+    AutoSell = true,
+    AutoArms = true,
+    AutoUpgrades = true,
+    AutoPlot = true,
+    AutoRebirth = true,
+    AutoOfflineReward = true,
+    AutoGroupReward = true,
+    AutoSpecialSpawns = true,
+    IndexPriority = true,
+    AdaptiveROI = true,
+    AntiAFK = true,
+
+    -- Teleport movement. Interactions still use the game's real zones/remotes and verify
+    -- the resulting server state before progression continues.
+    TeleportSettleDelay = 0.055,
+    TeleportRetries = 3,
+
+    -- Progression requirement brain. "Required" upgrades can bypass the optional spending
+    -- budgets below when they are the current bottleneck.
+    AutoRequirements = true,
+    RequiredBackpackFloor = 5,
+    ReserveCashForNearArm = true,
+    NearArmReserveRatio = 1.45,
+    BuyOptionalMoveSpeed = false,
+
+    -- 30/s is the game's configured limit. While lifting, the stock client also sends ~2 taps/s.
+    -- 27 keeps total lifting traffic under the intended cap while still training extremely quickly.
+    TapRate = 27,
+
+    -- A stage is considered efficient when its current estimated lift time is <= this value.
+    MaxLiftSeconds = 12,
+
+    -- Prevent a technically liftable target from turning into a bad long cumulative run.
+    MaxRunSeconds = 35,
+
+    -- Timed special treasure is worth stretching the run budget for, but still has a hard ceiling.
+    SpecialRunSeconds = 55,
+
+    -- If the next stage/rebirth is close, train first instead of doing a low-value short run.
+    TrainAheadRatio = 1.30,
+    RebirthTrainAheadRatio = 1.18,
+
+    -- Economy spending budgets. Arms are always first priority when the next arm is affordable.
+    BackpackBudgetFraction = 0.12,
+    PlotBudgetFraction = 0.15,
+    -- MoveSpeed does not affect teleport travel, so it is optional and disabled by default.
+    MoveSpeedBudgetFraction = 0.08,
+}
+
+P.S = {
+    Players = game:GetService("Players"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    CollectionService = game:GetService("CollectionService"),
+    VirtualUser = game:GetService("VirtualUser"),
+}
+P.Player = P.S.Players.LocalPlayer
+P.Shared = P.S.ReplicatedStorage:WaitForChild("Shared")
+
+local function safeRequire(object, label)
+    local ok, result = pcall(require, object)
+    if not ok then
+        error("[PuckAFK Lift Rock] Failed to require " .. tostring(label or object) .. ": " .. tostring(result))
+    end
+    return result
+end
+
+P.M = {}
+P.M.Config = safeRequire(P.Shared:WaitForChild("Config"), "Config")
+P.M.SharedUtils = safeRequire(P.Shared:WaitForChild("SharedUtils"), "SharedUtils")
+P.M.ItemUtils = safeRequire(P.Shared:WaitForChild("Modules"):WaitForChild("ItemUtils"), "ItemUtils")
+P.M.PlayerDataInfo = safeRequire(P.Shared.Modules:WaitForChild("PlayerDataInfo"), "PlayerDataInfo")
+P.M.UpgradeUtils = safeRequire(P.Shared.Modules:WaitForChild("UpgradeUtils"), "UpgradeUtils")
+P.M.LevelUtils = safeRequire(P.Shared.Modules:WaitForChild("LevelUtils"), "LevelUtils")
+P.M.ArmsUtils = safeRequire(P.Shared.Modules:WaitForChild("ArmsUtils"), "ArmsUtils")
+
+-- Optional helpers: the game itself uses StoneIncome to choose its best offline rock,
+-- and PlotController gives an exact reference to the local player's plot. Both have fallbacks.
+do
+    local offlineReward = P.Shared.Modules:FindFirstChild("OfflineReward")
+    local stoneIncomeModule = offlineReward and offlineReward:FindFirstChild("StoneIncome")
+    if stoneIncomeModule then
+        local ok, value = pcall(require, stoneIncomeModule)
+        if ok then
+            P.M.StoneIncome = value
+        end
+    end
+
+    local playerScripts = P.Player:WaitForChild("PlayerScripts")
+    local controllers = playerScripts:FindFirstChild("ClientControllers")
+    local plotModule = controllers and controllers:FindFirstChild("PlotController")
+    if plotModule then
+        local ok, value = pcall(require, plotModule)
+        if ok then
+            P.M.PlotController = value
+        end
+    end
+end
+P.M.DataAggregation = safeRequire(
+    P.Player:WaitForChild("PlayerScripts"):WaitForChild("ClientModules"):WaitForChild("DataAggregation"),
+    "DataAggregation"
+)
+P.Replica = P.M.DataAggregation.WaitForReplica()
+P.SessionReplica = P.M.DataAggregation.WaitForSessionReplica()
+
+P.R = {}
+for _, name in ipairs({
+    "TrainingTap",
+    "RockLiftingInput",
+    "RockLiftingFeedback",
+    "PickupStageTreasure",
+    "StageTreasuresBanked",
+    "SpecialStageSpawnChanged",
+    "GetSpecialStageSpawns",
+    "SellItems",
+    "ArmsAction",
+    "PurchaseUpgrade",
+    "UpgradePlot",
+    "PlaceBestLuck",
+    "PerformRebirth",
+    "CollectOfflineRewards",
+    "ClaimGroupReward",
+}) do
+    P.R[name] = P.M.SharedUtils.GetRemote(name)
+end
+
+function P:Connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(self.Connections, connection)
+    return connection
+end
+
+function P:Spawn(callback)
+    local thread = task.spawn(callback)
+    table.insert(self.Threads, thread)
+    return thread
+end
+
+function P:SetStatus(text, phase)
+    self.Status = tostring(text or "")
+    if phase then
+        self.Phase = phase
+    end
+end
+
+function P:Data()
+    return self.Replica and self.Replica.Data or {}
+end
+
+function P:SessionData()
+    return self.SessionReplica and self.SessionReplica.Data or {}
+end
+
+function P:GetCharacter()
+    local character = self.Player.Character
+    if not character or not character.Parent then
+        character = self.Player.CharacterAdded:Wait()
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 10)
+    local root = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 10)
+    if not humanoid or not root then
+        return nil, nil, nil
+    end
+    return character, humanoid, root
+end
+
+function P:ObjectPosition(object)
+    if not object then
+        return nil
+    end
+    if typeof(object) == "Vector3" then
+        return object
+    end
+    if typeof(object) == "CFrame" then
+        return object.Position
+    end
+    if typeof(object) ~= "Instance" then
+        return nil
+    end
+    if object:IsA("BasePart") then
+        return object.Position
+    end
+    if object:IsA("Model") then
+        local ok, cf = pcall(function()
+            return object:GetBoundingBox()
+        end)
+        if ok and cf then
+            return cf.Position
+        end
+        local primary = object.PrimaryPart or object:FindFirstChildWhichIsA("BasePart", true)
+        return primary and primary.Position or nil
+    end
+    local part = object:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+function P:IsPointInsidePart(part, worldPosition, inset)
+    if not part or not part:IsA("BasePart") or typeof(worldPosition) ~= "Vector3" then
+        return false
+    end
+    local localPoint = part.CFrame:PointToObjectSpace(worldPosition)
+    local half = part.Size * 0.5
+    inset = math.max(0, tonumber(inset) or 0)
+    local hx = math.max(0.05, half.X - math.min(inset, math.max(0, half.X - 0.05)))
+    local hz = math.max(0.05, half.Z - math.min(inset, math.max(0, half.Z - 0.05)))
+    return math.abs(localPoint.X) <= hx
+        and math.abs(localPoint.Z) <= hz
+        and math.abs(localPoint.Y) <= half.Y + 5
+end
+
+function P:ProjectToGround(worldPosition, extraExclude)
+    if typeof(worldPosition) ~= "Vector3" then
+        return nil
+    end
+    local character = self.Player.Character
+    local exclude = {}
+    if character then
+        table.insert(exclude, character)
+    end
+    if typeof(extraExclude) == "Instance" then
+        table.insert(exclude, extraExclude)
+    elseif type(extraExclude) == "table" then
+        for _, item in ipairs(extraExclude) do
+            if typeof(item) == "Instance" then
+                table.insert(exclude, item)
+            end
+        end
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude
+    params.IgnoreWater = false
+    pcall(function()
+        params.RespectCanCollide = true
+    end)
+
+    local origin = worldPosition + Vector3.new(0, 35, 0)
+    local result = workspace:Raycast(origin, Vector3.new(0, -120, 0), params)
+    if result then
+        return result.Position
+    end
+    return worldPosition
+end
+
+function P:GetZoneTeleportCFrame(zone)
+    if not zone or not zone:IsA("BasePart") then
+        return nil
+    end
+
+    local _, _, root = self:GetCharacter()
+    local half = zone.Size * 0.5
+    local localRoot = root and zone.CFrame:PointToObjectSpace(root.Position) or Vector3.zero
+
+    -- Enter near the closest interior edge rather than the geometric centre. Lift zones
+    -- commonly wrap a physical rock, so edge entry avoids spawning inside the rock mesh.
+    local marginX = math.min(math.max(0.8, half.X * 0.16), math.max(0.05, half.X - 0.05))
+    local marginZ = math.min(math.max(0.8, half.Z * 0.16), math.max(0.05, half.Z - 0.05))
+    local edgeX = math.max(0, half.X - marginX)
+    local edgeZ = math.max(0, half.Z - marginZ)
+
+    local normalizedX = math.abs(localRoot.X) / math.max(half.X, 0.1)
+    local normalizedZ = math.abs(localRoot.Z) / math.max(half.Z, 0.1)
+
+    local x, z
+    if normalizedX >= normalizedZ then
+        x = (localRoot.X >= 0 and 1 or -1) * edgeX * 0.88
+        z = math.clamp(localRoot.Z, -edgeZ * 0.70, edgeZ * 0.70)
+    else
+        z = (localRoot.Z >= 0 and 1 or -1) * edgeZ * 0.88
+        x = math.clamp(localRoot.X, -edgeX * 0.70, edgeX * 0.70)
+    end
+
+    local point = zone.CFrame:PointToWorldSpace(Vector3.new(x or 0, 0, z or 0))
+    local look = root and root.CFrame.LookVector or zone.CFrame.LookVector
+    local flatLook = Vector3.new(look.X, 0, look.Z)
+    if flatLook.Magnitude < 0.05 then
+        flatLook = Vector3.new(0, 0, -1)
+    else
+        flatLook = flatLook.Unit
+    end
+    return CFrame.lookAt(point, point + flatLook, Vector3.yAxis)
+end
+
+function P:StopWalking()
+    self.Navigation.Token = (self.Navigation.Token or 0) + 1
+    self.Navigation.Destination = nil
+    self.Navigation.LastResult = "Stopped"
+    self.Navigation.Repaths = 0
+    self.Navigation.Busy = false
+    self.Navigation.Waypoint = 0
+
+    local activeTween = self.Navigation.ActiveTween
+    self.Navigation.ActiveTween = nil
+    if activeTween then
+        pcall(function()
+            activeTween:Cancel()
+        end)
+    end
+
+    local character = self.Player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if humanoid then
+        pcall(function()
+            humanoid.Sit = false
+            humanoid.AutoRotate = true
+        end)
+    end
+    if root then
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+end
+
+function P:IsWalkTokenActive(token)
+    return self.Alive
+        and self.Settings.Enabled
+        and self.Navigation.Token == token
+end
+
+function P:WalkArrivalSatisfied(arrivalPredicate)
+    if type(arrivalPredicate) ~= "function" then
+        return nil
+    end
+    local ok, arrived = pcall(arrivalPredicate)
+    if ok then
+        return arrived == true
+    end
+    return false
+end
+
+function P:GetRootGroundOffset(humanoid, root)
+    if not humanoid or not root then
+        return 3
+    end
+    local hip = tonumber(humanoid.HipHeight) or 2
+    local halfRoot = math.max(0.5, root.Size.Y * 0.5)
+    return math.max(2.25, hip + halfRoot)
+end
+
+function P:GetTeleportRootTarget(surfacePosition, humanoid, root)
+    if typeof(surfacePosition) ~= "Vector3" then
+        return nil
+    end
+    return Vector3.new(
+        surfacePosition.X,
+        surfacePosition.Y + self:GetRootGroundOffset(humanoid, root),
+        surfacePosition.Z
+    )
+end
+
+function P:TeleportToCFrame(targetCFrame, arrivalPredicate)
+    if typeof(targetCFrame) ~= "CFrame" then
+        return false
+    end
+
+    local _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return false
+    end
+
+    self.Navigation.Token = (self.Navigation.Token or 0) + 1
+    local token = self.Navigation.Token
+    self.Navigation.Destination = targetCFrame.Position
+    self.Navigation.LastResult = "Teleporting"
+    self.Navigation.Busy = true
+    self.Navigation.Repaths = 0
+    self.Navigation.Waypoint = 0
+
+    humanoid.Sit = false
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = targetCFrame
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+
+    task.wait(math.clamp(tonumber(self.Settings.TeleportSettleDelay) or 0.055, 0.01, 0.35))
+
+    if not self:IsWalkTokenActive(token) then
+        return false
+    end
+
+    local arrived = true
+    if type(arrivalPredicate) == "function" then
+        arrived = self:WalkArrivalSatisfied(arrivalPredicate) == true
+    end
+
+    if self.Navigation.Token == token then
+        self.Navigation.Destination = nil
+        self.Navigation.LastResult = arrived and "Teleported" or "Teleport not confirmed"
+        self.Navigation.Busy = false
+    end
+    return arrived
+end
+
+function P:TeleportTo(objectOrCFrame, yOffset)
+    local _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return false
+    end
+
+    local targetCFrame
+    if typeof(objectOrCFrame) == "CFrame" then
+        targetCFrame = objectOrCFrame
+    elseif typeof(objectOrCFrame) == "Vector3" then
+        local projected = self:ProjectToGround(objectOrCFrame)
+        local target = projected and self:GetTeleportRootTarget(projected, humanoid, root)
+        if target then
+            local look = root.CFrame.LookVector
+            local flatLook = Vector3.new(look.X, 0, look.Z)
+            if flatLook.Magnitude < 0.05 then
+                flatLook = Vector3.new(0, 0, -1)
+            else
+                flatLook = flatLook.Unit
+            end
+            targetCFrame = CFrame.lookAt(target, target + flatLook, Vector3.yAxis)
+        end
+    elseif typeof(objectOrCFrame) == "Instance" then
+        if objectOrCFrame:IsA("BasePart") then
+            targetCFrame = objectOrCFrame.CFrame
+        elseif objectOrCFrame:IsA("Model") then
+            local ok, pivot = pcall(function()
+                return objectOrCFrame:GetPivot()
+            end)
+            if ok then
+                targetCFrame = pivot
+            end
+        end
+    end
+
+    if not targetCFrame then
+        return false
+    end
+
+    if yOffset and yOffset ~= 0 then
+        targetCFrame = targetCFrame * CFrame.new(0, yOffset, 0)
+    end
+    return self:TeleportToCFrame(targetCFrame)
+end
+
+function P:WalkToPosition(goalPosition, options)
+    options = options or {}
+    if typeof(goalPosition) ~= "Vector3" then
+        return false
+    end
+
+    local _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return false
+    end
+
+    local arrivalPredicate = options.ArrivalPredicate
+    if type(arrivalPredicate) == "function" and self:WalkArrivalSatisfied(arrivalPredicate) then
+        return true
+    end
+
+    local projected = options.ProjectGround == false
+        and goalPosition
+        or self:ProjectToGround(goalPosition, options.Exclude)
+    if not projected then
+        projected = goalPosition
+    end
+
+    local target = options.ProjectGround == false
+        and projected
+        or self:GetTeleportRootTarget(projected, humanoid, root)
+    if not target then
+        return false
+    end
+
+    local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
+    local facing = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+    if facing.Magnitude < 0.05 then
+        facing = Vector3.new(0, 0, -1)
+    else
+        facing = facing.Unit
+    end
+
+    local retries = math.clamp(
+        math.floor(tonumber(options.MaxAttempts) or tonumber(self.Settings.TeleportRetries) or 3),
+        1,
+        6
+    )
+
+    for attempt = 1, retries do
+        self.Navigation.Repaths = attempt - 1
+        self.Navigation.LastResult = attempt == 1 and "Teleporting" or ("Teleport retry " .. tostring(attempt - 1))
+        local ok = self:TeleportToCFrame(
+            CFrame.lookAt(target, target + facing, Vector3.yAxis),
+            arrivalPredicate
+        )
+        if ok then
+            return true
+        end
+        task.wait(0.03)
+    end
+
+    if type(arrivalPredicate) == "function" then
+        return self:WalkArrivalSatisfied(arrivalPredicate) == true
+    end
+
+    _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root then
+        return false
+    end
+    local acceptance = math.max(1, tonumber(options.AcceptanceRadius) or 3)
+    return (root.Position - target).Magnitude <= acceptance + 1
+end
+
+function P:WalkToObject(object, acceptance)
+    local position = self:ObjectPosition(object)
+    if not position then
+        return false
+    end
+    return self:WalkToPosition(position, {
+        AcceptanceRadius = acceptance or 4,
+        Exclude = typeof(object) == "Instance" and object or nil,
+    })
+end
+
+function P:WalkIntoZone(zone)
+    if not zone then
+        return false
+    end
+    if not zone:IsA("BasePart") then
+        return self:WalkToObject(zone, 4)
+    end
+
+    local function inside()
+        local _, _, root = self:GetCharacter()
+        return root and self:IsPointInsidePart(zone, root.Position, 0.04)
+    end
+
+    if inside() then
+        return true
+    end
+
+    local candidates = {}
+    local primary = self:GetZoneTeleportCFrame(zone)
+    if primary then
+        table.insert(candidates, primary)
+    end
+
+    -- Fallback points are all inside the trigger and intentionally avoid the exact centre
+    -- until the last attempt, reducing the chance of materializing inside the rock mesh.
+    local half = zone.Size * 0.5
+    local x = math.max(0, half.X * 0.55)
+    local z = math.max(0, half.Z * 0.55)
+    for _, localPoint in ipairs({
+        Vector3.new(x, 0, z),
+        Vector3.new(-x, 0, z),
+        Vector3.new(x, 0, -z),
+        Vector3.new(-x, 0, -z),
+        Vector3.zero,
+    }) do
+        local point = zone.CFrame:PointToWorldSpace(localPoint)
+        table.insert(candidates, CFrame.new(point))
+    end
+
+    local maxTries = math.min(#candidates, math.max(2, tonumber(self.Settings.TeleportRetries) or 3) + 2)
+    for index = 1, maxTries do
+        if inside() then
+            return true
+        end
+        self.Navigation.LastResult = index == 1 and "Teleporting into zone" or ("Zone TP retry " .. tostring(index - 1))
+        self:TeleportToCFrame(candidates[index])
+        if self:WaitUntil(inside, 0.45, 0.03) then
+            return true
+        end
+    end
+
+    return inside() == true
+end
+
+function P:WalkOutOfZone(zone, extraDistance)
+    if not zone or not zone:IsA("BasePart") then
+        return false
+    end
+    local _, humanoid, root = self:GetCharacter()
+    if not root or not humanoid then
+        return false
+    end
+    if not self:IsPointInsidePart(zone, root.Position, 0) then
+        return true
+    end
+
+    local center = zone.Position
+    local offset = Vector3.new(root.Position.X - center.X, 0, root.Position.Z - center.Z)
+    if offset.Magnitude < 0.5 then
+        local look = zone.CFrame.LookVector
+        offset = Vector3.new(-look.X, 0, -look.Z)
+    end
+    if offset.Magnitude < 0.1 then
+        offset = Vector3.new(0, 0, -1)
+    end
+
+    local distance = math.max(zone.Size.X, zone.Size.Z) * 0.5 + (tonumber(extraDistance) or 7)
+    local raw = center + offset.Unit * distance
+    local projected = self:ProjectToGround(raw, zone) or raw
+    local target = self:GetTeleportRootTarget(projected, humanoid, root)
+    if not target then
+        return false
+    end
+
+    local facing = Vector3.new(offset.Unit.X, 0, offset.Unit.Z)
+    local ok = self:TeleportToCFrame(
+        CFrame.lookAt(target, target + facing, Vector3.yAxis),
+        function()
+            local _, _, currentRoot = self:GetCharacter()
+            return currentRoot and not self:IsPointInsidePart(zone, currentRoot.Position, 0)
+        end
+    )
+    return ok
+end
+
+function P:WaitUntil(predicate, timeout, interval)
+    local deadline = os.clock() + (timeout or 5)
+    repeat
+        local ok, result = pcall(predicate)
+        if ok and result then
+            return true, result
+        end
+        task.wait(interval or 0.05)
+    until not self.Alive or os.clock() >= deadline
+    return false
+end
+
+function P:Map()
+    return workspace:FindFirstChild("Map")
+end
+
+function P:GetStage(stageId)
+    local map = self:Map()
+    local stages = map and map:FindFirstChild("Stages")
+    if not stages then
+        return nil
+    end
+    for _, stage in ipairs(stages:GetChildren()) do
+        if stage:IsA("Model") and tonumber(stage:GetAttribute("StageId")) == tonumber(stageId) then
+            return stage
+        end
+    end
+    return nil
+end
+
+function P:GetStageWeight(stageId)
+    local stage = self:GetStage(stageId)
+    if not stage then
+        return math.huge
+    end
+    local key = stage:GetAttribute("StoneKey")
+    local config = key and self.M.Config.Stones[key]
+    return config and tonumber(config.Weight) or math.huge
+end
+
+function P:GetMaxStage()
+    local map = self:Map()
+    local stages = map and map:FindFirstChild("Stages")
+    local maxStage = 0
+    if stages then
+        for _, stage in ipairs(stages:GetChildren()) do
+            maxStage = math.max(maxStage, tonumber(stage:GetAttribute("StageId")) or 0)
+        end
+    end
+    return maxStage
+end
+
+function P:BackpackCapacity()
+    return tonumber(self.M.UpgradeUtils.GetValue(self:Data(), "Backpack")) or 3
+end
+
+function P:BackpackCount()
+    local temporary = self:SessionData().TemporaryBackpack
+    if type(temporary) ~= "table" then
+        return 0
+    end
+    local count = 0
+    for _ in pairs(temporary) do
+        count = count + 1
+    end
+    return count
+end
+
+function P:IsAtSpawn()
+    local map = self:Map()
+    local spawnZone = map and map:FindFirstChild("SpawnZone")
+    local _, _, root = self:GetCharacter()
+    if not spawnZone or not root or not spawnZone:IsA("BasePart") then
+        return false
+    end
+    return self:IsPointInsidePart(spawnZone, root.Position, 0)
+end
+
+function P:MoveToSpawn()
+    local map = self:Map()
+    local zone = map and map:FindFirstChild("SpawnZone")
+    if not zone then
+        return false
+    end
+    self:SetStatus("Teleporting to spawn to bank treasure...", "TP")
+    local reached = self:WalkIntoZone(zone)
+    if reached then
+        self:SetStatus("Banking treasure at spawn...", "BANK")
+    end
+    return reached
+end
+
+function P:ClearRunState()
+    self.Run.Cleared = {}
+    self.Run.Rewards = {}
+    self.Run.Progress = {}
+    self.Run.Session = nil
+    self.Run.LastReset = os.clock()
+end
+
+function P:ApplySnapshot(snapshot)
+    self.Run.Cleared = {}
+    self.Run.Rewards = {}
+    self.Run.Progress = {}
+    self.Run.Session = nil
+    if type(snapshot) ~= "table" then
+        return
+    end
+    self.Run.Synced = true
+
+    -- Snapshot containers are intentionally handled with pairs rather than ipairs because the
+    -- game's own Restore code accepts both arrays and keyed tables.
+    if type(snapshot.Cleared) == "table" then
+        for key, value in pairs(snapshot.Cleared) do
+            local stageId
+            if value == true then
+                stageId = tonumber(key)
+            else
+                stageId = tonumber(value)
+            end
+            if stageId then
+                self.Run.Cleared[stageId] = true
+            end
+        end
+    end
+
+    if type(snapshot.Progress) == "table" then
+        for key, value in pairs(snapshot.Progress) do
+            local stageId = tonumber(key)
+            if stageId then
+                if type(value) == "table" then
+                    self.Run.Progress[stageId] = tonumber(value.Progress) or 0
+                else
+                    self.Run.Progress[stageId] = tonumber(value) or 0
+                end
+            end
+        end
+    end
+
+    if type(snapshot.Rewards) == "table" then
+        for _, reward in pairs(snapshot.Rewards) do
+            if type(reward) == "table" and tonumber(reward.StageId) then
+                local stageId = tonumber(reward.StageId)
+                self.Run.Rewards[stageId] = {
+                    StageId = stageId,
+                    Items = type(reward.Items) == "table" and reward.Items or {},
+                    Completed = reward.Completed == true,
+                }
+            end
+        end
+    end
+
+    if type(snapshot.Session) == "table" then
+        self.Run.Session = snapshot.Session
+        local stageId = tonumber(snapshot.Session.StageId)
+        if stageId and tonumber(snapshot.Session.Progress) then
+            self.Run.Progress[stageId] = tonumber(snapshot.Session.Progress)
+        end
+        if stageId and type(snapshot.Session.Items) == "table" then
+            local reward = self.Run.Rewards[stageId] or {StageId = stageId, Items = {}, Completed = false}
+            reward.Items = snapshot.Session.Items
+            self.Run.Rewards[stageId] = reward
+        end
+    end
+end
+
+function P:InstallRemoteObservers()
+    self:Connect(self.R.RockLiftingFeedback.OnClientEvent, function(kind, payload)
+        self.Run.LastFeedback = os.clock()
+        if kind == "Snapshot" then
+            self:ApplySnapshot(payload)
+        elseif kind == "Reset" then
+            self:ClearRunState()
+            self.Run.Synced = true
+        elseif kind == "Started" and type(payload) == "table" then
+            self.Run.Synced = true
+            self.Run.Session = payload
+            local stageId = tonumber(payload.StageId)
+            if stageId then
+                self.Run.Progress[stageId] = tonumber(payload.Progress) or self.Run.Progress[stageId] or 0
+                local reward = self.Run.Rewards[stageId] or {StageId = stageId, Items = {}, Completed = false}
+                if type(payload.Items) == "table" then
+                    reward.Items = payload.Items
+                end
+                self.Run.Rewards[stageId] = reward
+            end
+        elseif kind == "Progress" and type(payload) == "table" then
+            self.Run.Synced = true
+            local stageId = tonumber(payload.StageId)
+            if stageId then
+                self.Run.Progress[stageId] = tonumber(payload.Progress) or self.Run.Progress[stageId] or 0
+            end
+            if self.Run.Session and self.Run.Session.SessionId == payload.SessionId then
+                self.Run.Session.Progress = payload.Progress
+                self.Run.Session.Rate = payload.Rate
+                self.Run.Session.UpdatedAt = payload.UpdatedAt
+            end
+        elseif kind == "Completed" and type(payload) == "table" then
+            self.Run.Synced = true
+            local stageId = tonumber(payload.StageId)
+            if stageId then
+                self.Run.Cleared[stageId] = true
+                self.Run.Progress[stageId] = 1
+                local reward = self.Run.Rewards[stageId] or {StageId = stageId, Items = {}, Completed = false}
+                if type(payload.Items) == "table" then
+                    reward.Items = payload.Items
+                end
+                reward.Completed = true
+                self.Run.Rewards[stageId] = reward
+            end
+            if self.Run.Session and self.Run.Session.SessionId == payload.SessionId then
+                self.Run.Session = nil
+            end
+        elseif kind == "Stopped" and type(payload) == "table" then
+            self.Run.Synced = true
+            local stageId = tonumber(payload.StageId)
+            if stageId then
+                self.Run.Progress[stageId] = tonumber(payload.Progress) or self.Run.Progress[stageId] or 0
+            end
+            if self.Run.Session and self.Run.Session.SessionId == payload.SessionId then
+                self.Run.Session = nil
+            end
+        end
+    end)
+
+    self:Connect(self.R.StageTreasuresBanked.OnClientEvent, function()
+        self.Run.LastBank = os.clock()
+    end)
+
+    self:Connect(self.R.SpecialStageSpawnChanged.OnClientEvent, function(entry)
+        self:ReceiveSpecialSpawn(entry)
+    end)
+
+    self:Connect(self.Player.CharacterAdded, function()
+        task.delay(1, function()
+            if self.Alive then
+                pcall(function()
+                    self.R.RockLiftingInput:FireServer("Sync")
+                end)
+            end
+        end)
+    end)
+
+    pcall(function()
+        self.R.RockLiftingInput:FireServer("Sync")
+    end)
+end
+
+function P:ReceiveSpecialSpawn(entry)
+    if type(entry) ~= "table" then
+        return
+    end
+    local stageId = tonumber(entry.StageId)
+    local slot = entry.Slot
+    if not stageId or type(slot) ~= "string" then
+        return
+    end
+
+    self.Run.Specials[stageId] = self.Run.Specials[stageId] or {}
+    self.Run.SpecialRevisions[stageId] = self.Run.SpecialRevisions[stageId] or {}
+    local oldRevision = tonumber(self.Run.SpecialRevisions[stageId][slot]) or -math.huge
+    local newRevision = tonumber(entry.Revision) or oldRevision + 1
+    if newRevision <= oldRevision then
+        return
+    end
+    self.Run.SpecialRevisions[stageId][slot] = newRevision
+
+    if type(entry.Item) == "table" then
+        self.Run.Specials[stageId][slot] = entry
+    else
+        -- SpecialStageSpawnChanged also carries removals. Keep the revision tombstone but remove
+        -- the active item so an expired special can never keep attracting the route planner.
+        self.Run.Specials[stageId][slot] = nil
+    end
+end
+
+function P:RefreshSpecialSpawns(force)
+    if not self.Settings.AutoSpecialSpawns then
+        return
+    end
+    if not force and os.clock() - self.LastSpecialSync < 20 then
+        return
+    end
+    self.LastSpecialSync = os.clock()
+    local ok, result = pcall(function()
+        return self.R.GetSpecialStageSpawns:InvokeServer()
+    end)
+    if ok and type(result) == "table" then
+        -- This call is an authoritative snapshot, not a delta stream. Rebuild the active cache
+        -- directly so an unchanged Revision is not incorrectly rejected as stale.
+        local fresh = {}
+        for _, entry in pairs(result) do
+            if type(entry) == "table" then
+                local stageId = tonumber(entry.StageId)
+                local slot = entry.Slot
+                if stageId and type(slot) == "string" and type(entry.Item) == "table" then
+                    fresh[stageId] = fresh[stageId] or {}
+                    fresh[stageId][slot] = entry
+                    self.Run.SpecialRevisions[stageId] = self.Run.SpecialRevisions[stageId] or {}
+                    local revision = tonumber(entry.Revision)
+                    if revision then
+                        self.Run.SpecialRevisions[stageId][slot] = math.max(
+                            tonumber(self.Run.SpecialRevisions[stageId][slot]) or -math.huge,
+                            revision
+                        )
+                    end
+                end
+            end
+        end
+        self.Run.Specials = fresh
+    end
+end
+
+function P:EnsureRunSynced()
+    if self.Run.Synced or self.Run.LastFeedback > 0 then
+        return true
+    end
+    pcall(function()
+        self.R.RockLiftingInput:FireServer("Sync")
+    end)
+    local ok = self:WaitUntil(function()
+        return self.Run.Synced or self.Run.LastFeedback > 0
+    end, 2.0, 0.05)
+    return ok == true
+end
+
+function P:IsStageCleared(stageId)
+    return self.Run.Cleared[tonumber(stageId)] == true
+end
+
+function P:HighestCleared()
+    local highest = 0
+    for stageId, cleared in pairs(self.Run.Cleared) do
+        if cleared then
+            highest = math.max(highest, tonumber(stageId) or 0)
+        end
+    end
+    return highest
+end
+
+function P:CurrentPower()
+    return math.max(1, tonumber(self:Data().Power) or 1)
+end
+
+function P:CurrentLevel()
+    return math.max(1, tonumber(self:Data().Level) or 1)
+end
+
+function P:CurrentRebirths()
+    return math.max(0, tonumber(self:Data().Rebirths) or 0)
+end
+
+function P:NextRebirthInfo()
+    local entry = self.M.Config.Rebirth.Levels[self:CurrentRebirths() + 1]
+    if not entry then
+        return nil
+    end
+    return entry, tonumber(entry.LevelRequired)
+end
+
+function P:CanRebirth()
+    local _, levelRequired = self:NextRebirthInfo()
+    return levelRequired ~= nil and self:CurrentLevel() >= levelRequired
+end
+
+function P:NextRebirthPower()
+    local _, levelRequired = self:NextRebirthInfo()
+    if not levelRequired then
+        return nil
+    end
+    local ok, power = pcall(self.M.LevelUtils.GetRequiredPower, levelRequired)
+    return ok and tonumber(power) or nil
+end
+
+function P:CumulativeLiftSeconds(stageId, power)
+    power = math.max(1, tonumber(power) or self:CurrentPower())
+    local total = 0
+    for id = 1, math.max(0, tonumber(stageId) or 0) do
+        local weight = self:GetStageWeight(id)
+        if weight == math.huge then
+            return math.huge
+        end
+        total = total + weight / power
+    end
+    return total
+end
+
+function P:HighestEfficientStage(power)
+    power = math.max(1, tonumber(power) or self:CurrentPower())
+    local maxStage = self:GetMaxStage()
+    local highest = 0
+    for stageId = 1, maxStage do
+        local weight = self:GetStageWeight(stageId)
+        if weight == math.huge then
+            break
+        end
+        local seconds = weight / power
+        local runSeconds = self:CumulativeLiftSeconds(stageId, power)
+        if seconds <= self.Settings.MaxLiftSeconds and runSeconds <= self.Settings.MaxRunSeconds then
+            highest = stageId
+        else
+            break
+        end
+    end
+    return highest
+end
+
+function P:GetGameROIStage()
+    if not self.Settings.AdaptiveROI or type(self.M.StoneIncome) ~= "table" or type(self.M.StoneIncome.Estimate) ~= "function" then
+        self.Route.GameROIStage = 0
+        self.Route.CashPerSecond = 0
+        self.Route.ExpectedItemValue = 0
+        self.Route.TripSeconds = 0
+        return 0
+    end
+    local ok, estimate = pcall(self.M.StoneIncome.Estimate, self:Data())
+    if not ok or type(estimate) ~= "table" then
+        return 0
+    end
+    self.Route.GameROIStage = tonumber(estimate.StageId) or 0
+    self.Route.CashPerSecond = tonumber(estimate.CashPerSecond) or 0
+    self.Route.ExpectedItemValue = tonumber(estimate.ExpectedItemValue) or 0
+    self.Route.TripSeconds = tonumber(estimate.TripSeconds) or 0
+    return self.Route.GameROIStage
+end
+
+function P:GetSpecialPriorityStage(power)
+    if not self.Settings.AutoSpecialSpawns then
+        return 0
+    end
+    local maxStage = self:GetMaxStage()
+    local best = 0
+    for stageId, slots in pairs(self.Run.Specials) do
+        if stageId <= maxStage and type(slots) == "table" then
+            local active = false
+            for _, entry in pairs(slots) do
+                if type(entry) == "table" and type(entry.Item) == "table" then
+                    active = true
+                    break
+                end
+            end
+            if active then
+                local individual = self:GetStageWeight(stageId) / math.max(1, power)
+                local cumulative = self:CumulativeLiftSeconds(stageId, power)
+                if individual <= self.Settings.MaxLiftSeconds * 1.75 and cumulative <= self.Settings.SpecialRunSeconds then
+                    best = math.max(best, stageId)
+                end
+            end
+        end
+    end
+    return best
+end
+
+function P:ChooseTargetStage()
+    self:RefreshSpecialSpawns(false)
+    local power = self:CurrentPower()
+    local efficient = self:HighestEfficientStage(power)
+    if efficient <= 0 then
+        return 0
+    end
+
+    local target = efficient
+    local roiStage = self:GetGameROIStage()
+    if self.Settings.AdaptiveROI and roiStage > 0 then
+        -- The game's estimator prices normal travel time and move-speed upgrades.
+        -- Because this build also uses deliberately slow traversal, respect that target directly instead of
+        -- artificially pushing one stage above it as the old teleport route did.
+        target = math.min(efficient, math.max(1, roiStage))
+    end
+
+    target = math.max(target, self:GetSpecialPriorityStage(power))
+    return math.clamp(target, 0, self:GetMaxStage())
+end
+
+function P:ChooseTrainingTarget()
+    local power = self:CurrentPower()
+    local target = self:ChooseTargetStage()
+    local maxStage = self:GetMaxStage()
+
+    if target <= 0 then
+        local required = self:GetStageWeight(1) / math.max(0.1, self.Settings.MaxLiftSeconds)
+        return math.ceil(required), "Stage 1 efficiency"
+    end
+
+    local nextStage = target + 1
+    local bestTarget = nil
+    local reason = nil
+    if nextStage <= maxStage then
+        local threshold = self:GetStageWeight(nextStage) / math.max(0.1, self.Settings.MaxLiftSeconds)
+        if threshold > power and threshold <= power * self.Settings.TrainAheadRatio then
+            bestTarget = math.ceil(threshold)
+            reason = "Stage " .. tostring(nextStage) .. " efficiency"
+        end
+    end
+
+    local rebirthPower = self:NextRebirthPower()
+    if rebirthPower and rebirthPower > power and rebirthPower <= power * self.Settings.RebirthTrainAheadRatio then
+        if not bestTarget or rebirthPower < bestTarget then
+            bestTarget = math.ceil(rebirthPower)
+            reason = "next rebirth"
+        end
+    end
+
+    if self.Settings.AutoRequirements then
+        local requirement = self:RefreshRequirementPlan()
+        if requirement.Kind == "Power"
+            and tonumber(requirement.TargetPower)
+            and requirement.TargetPower > power then
+            if not bestTarget or requirement.TargetPower < bestTarget then
+                bestTarget = math.ceil(requirement.TargetPower)
+                reason = requirement.Name
+            end
+        end
+    end
+
+    return bestTarget, reason
+end
+
+function P:GetBestTrainingStationId()
+    local data = self:Data()
+    local rebirths = self:CurrentRebirths()
+    local bestId = nil
+    local bestMultiplier = 1
+    for stationId, config in ipairs(self.M.Config.Training or {}) do
+        local unlocked = false
+        if config.Gamepass then
+            local ok, has = pcall(self.M.PlayerDataInfo.HasGamepass, data, config.Gamepass)
+            unlocked = ok and has == true
+        else
+            unlocked = rebirths >= (tonumber(config.RequiredRebirths) or 0)
+        end
+        local multiplier = tonumber(config.Multiplier) or 1
+        if unlocked and multiplier > bestMultiplier then
+            bestMultiplier = multiplier
+            bestId = stationId
+        elseif unlocked and not bestId then
+            bestId = stationId
+            bestMultiplier = multiplier
+        end
+    end
+    return bestId, bestMultiplier
+end
+
+function P:GetTrainingModel(stationId)
+    for _, model in ipairs(self.S.CollectionService:GetTagged("Training")) do
+        if tonumber(model:GetAttribute("Id")) == tonumber(stationId) and model:IsDescendantOf(workspace) then
+            return model
+        end
+    end
+    return nil
+end
+
+function P:GetTrainingPartCandidates(model)
+    local candidates = {}
+    local seen = {}
+    local preferred = {
+        Zone = 100,
+        TrainingZone = 95,
+        Trigger = 90,
+        Area = 85,
+        Hitbox = 80,
+        Platform = 60,
+        Floor = 55,
+    }
+    for _, part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local score = preferred[part.Name] or 0
+            if part.Transparency >= 0.95 and not part.CanCollide then
+                score = score + 35
+            end
+            local volume = part.Size.X * part.Size.Y * part.Size.Z
+            score = score + math.min(25, (math.log(math.max(1, volume)) / math.log(2)))
+            table.insert(candidates, {Part = part, Score = score})
+            seen[part] = true
+        end
+    end
+    if model.PrimaryPart and not seen[model.PrimaryPart] then
+        table.insert(candidates, {Part = model.PrimaryPart, Score = 50})
+    end
+    table.sort(candidates, function(a, b)
+        return a.Score > b.Score
+    end)
+    return candidates
+end
+
+function P:EnterTrainingStation(stationId)
+    if tonumber(self.Player:GetAttribute("TrainingStation")) == tonumber(stationId) then
+        return true
+    end
+    local model = self:GetTrainingModel(stationId)
+    if not model then
+        return false
+    end
+    local candidates = self:GetTrainingPartCandidates(model)
+    for index = 1, math.min(#candidates, 8) do
+        local part = candidates[index].Part
+        if part and part.Parent then
+            self:SetStatus("Teleporting to training station " .. tostring(stationId) .. "...", "TP")
+            local reached = self:WalkIntoZone(part)
+            if reached then
+                local entered = self:WaitUntil(function()
+                    return tonumber(self.Player:GetAttribute("TrainingStation")) == tonumber(stationId)
+                end, 1.15, 0.05)
+                if entered then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function P:TrainToPower(targetPower, reason)
+    if not self.Settings.AutoTrain or not targetPower then
+        return false
+    end
+    targetPower = math.max(self:CurrentPower(), tonumber(targetPower) or self:CurrentPower())
+    local stationId, multiplier = self:GetBestTrainingStationId()
+    if stationId then
+        self:EnterTrainingStation(stationId)
+    else
+        self:MoveToSpawn()
+    end
+
+    self.TrainingTarget = targetPower
+    local started = os.clock()
+    while self.Alive and self.Settings.Enabled and self.Settings.AutoTrain do
+        local power = self:CurrentPower()
+        self:SetStatus(
+            string.format("Training to %s Strength (%s, station x%s)", self:Compact(targetPower), tostring(reason or "progression"), tostring(multiplier or 1)),
+            "TRAIN"
+        )
+        if power >= targetPower then
+            self.TrainingTarget = nil
+            return true
+        end
+        if self.Settings.AutoRebirth and self:CanRebirth() then
+            self.TrainingTarget = nil
+            return true
+        end
+        if stationId and tonumber(self.Player:GetAttribute("TrainingStation")) ~= tonumber(stationId) then
+            self:EnterTrainingStation(stationId)
+        end
+        if os.clock() - started > 180 then
+            self.TrainingTarget = nil
+            return false
+        end
+        task.wait(0.12)
+    end
+    self.TrainingTarget = nil
+    return false
+end
+
+function P:LiftStage(stageId)
+    if self:IsStageCleared(stageId) then
+        return true
+    end
+    if not self.Settings.AutoLift then
+        return false
+    end
+    local stage = self:GetStage(stageId)
+    local zone = stage and stage:FindFirstChild("LiftZone")
+    if not stage or not zone then
+        self.LastError = "Missing stage/LiftZone for " .. tostring(stageId)
+        return false
+    end
+
+    local weight = self:GetStageWeight(stageId)
+    local estimated = weight / math.max(1, self:CurrentPower())
+    -- Teleport approach is effectively instant; the deadline now mostly covers the lift itself
+    -- plus server feedback/retrigger headroom.
+    local deadline = os.clock() + math.clamp(estimated * 2.15 + 10, 15, 100)
+    local retries = 0
+
+    while self.Alive and self.Settings.Enabled and self.Settings.AutoLift and os.clock() < deadline do
+        if self:IsStageCleared(stageId) then
+            return true
+        end
+
+        local session = self.Run.Session
+        if not session or tonumber(session.StageId) ~= tonumber(stageId) then
+            retries += 1
+            self:SetStatus(
+                string.format("Teleporting to Stage %d • %ss lift estimate", stageId, self:Compact(math.max(0.1, weight / math.max(1, self:CurrentPower())))),
+                "TP"
+            )
+
+            -- If the zone did not start after a prior entry, teleport out and back in
+            -- to retrigger the authoritative zone-driven lifting session.
+            if retries > 1 then
+                self:WalkOutOfZone(zone, 7)
+                task.wait(0.08)
+            end
+
+            local reached = self:WalkIntoZone(zone)
+            if not reached then
+                self.LastError = "Could not path into Stage " .. tostring(stageId) .. " LiftZone"
+                task.wait(0.2)
+            else
+                self:SetStatus(
+                    string.format("Lifting Stage %d • %ss estimated", stageId, self:Compact(math.max(0.1, weight / math.max(1, self:CurrentPower())))),
+                    "LIFT"
+                )
+                task.wait(0.4)
+            end
+
+            if retries % 3 == 0 then
+                pcall(function()
+                    self.R.RockLiftingInput:FireServer("Sync")
+                end)
+            end
+            task.wait(0.12)
+        else
+            self:SetStatus(
+                string.format("Lifting Stage %d • %ss estimated", stageId, self:Compact(math.max(0.1, weight / math.max(1, self:CurrentPower())))),
+                "LIFT"
+            )
+            local _, _, root = self:GetCharacter()
+            if root and zone:IsA("BasePart") and not self:IsPointInsidePart(zone, root.Position, 0) then
+                self:SetStatus("Teleporting back into Stage " .. tostring(stageId) .. " LiftZone...", "TP")
+                self:WalkIntoZone(zone)
+            end
+            task.wait(0.12)
+        end
+    end
+
+    if not self:IsStageCleared(stageId) then
+        pcall(function()
+            self.R.RockLiftingInput:FireServer("Sync")
+        end)
+    end
+    return self:IsStageCleared(stageId)
+end
+
+function P:DiscoveryCount(variant)
+    local discovered = self:Data().DiscoveredItems
+    local bucket = type(discovered) == "table" and discovered[variant] or nil
+    local count = 0
+    if type(bucket) == "table" then
+        -- Match PlayerDataInfo.GetIndexCashMultiplier exactly: every true discovery in the variant
+        -- bucket counts toward its FullBoost threshold.
+        for _, value in pairs(bucket) do
+            if value == true then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
+function P:VariantCountsForIndex(variant)
+    local variants = self.M.Config.Variants or {}
+    local info = variants[variant]
+    local index = self.M.Config.Index or {}
+    local fullBoost = index.FullBoost or {}
+    return type(info) == "table" and info.ExcludeIndex ~= true and tonumber(fullBoost[variant]) ~= nil
+end
+
+function P:IsDiscovered(item)
+    if type(item) ~= "table" then
+        return false
+    end
+    local variant = item.Variant or "Normal"
+    local discovered = self:Data().DiscoveredItems
+    local bucket = type(discovered) == "table" and discovered[variant] or nil
+    return type(bucket) == "table" and bucket[item.Key] == true
+end
+
+function P:RarityRank(item)
+    local rarity
+    local ok, result = pcall(self.M.ItemUtils.GetRarity, item)
+    if ok then
+        rarity = result
+    end
+    local ranks = {
+        Common = 1,
+        Uncommon = 2,
+        Rare = 3,
+        Epic = 4,
+        Legendary = 5,
+        Mythic = 6,
+        Secret = 7,
+        Celestial = 8,
+        Divine = 9,
+        Exclusive = 10,
+    }
+    return ranks[rarity] or 0, rarity
+end
+
+function P:CandidateData(stageId, slot, item, special)
+    local rank, rarity = self:RarityRank(item)
+    local price = 0
+    local luck = 0
+    local cashMultiplier = 1
+    local okMulti, multiResult = pcall(self.M.PlayerDataInfo.GetCashMultiplier, self.Player)
+    if okMulti then
+        cashMultiplier = tonumber(multiResult) or 1
+    end
+    local okPrice, priceResult = pcall(self.M.ItemUtils.GetSellPrice, item, cashMultiplier)
+    if okPrice then
+        price = tonumber(priceResult) or 0
+    end
+    local okDisplay, display = pcall(self.M.ItemUtils.GetAllDisplayData, item)
+    if okDisplay and type(display) == "table" then
+        luck = tonumber(display.LuckBonus) or 0
+    end
+
+    local variant = item.Variant or "Normal"
+    local threshold = tonumber(self.M.Config.Index and self.M.Config.Index.Threshold) or 60
+    local indexEligible = self:VariantCountsForIndex(variant)
+    local indexIncomplete = indexEligible and self:DiscoveryCount(variant) < threshold
+    local newDiscovery = self.Settings.IndexPriority and indexIncomplete and not self:IsDiscovered(item)
+
+    -- Rarity remains the dominant signal. Specials and useful index discoveries can beat a nearby
+    -- tier, while sell value/luck break ties and improve long-term plot/cash progression.
+    local priorityScore = rank * 1000000
+    if special == true then
+        priorityScore = priorityScore + 800000
+    end
+    if newDiscovery == true then
+        priorityScore = priorityScore + 1100000
+    end
+    priorityScore = priorityScore + math.min(500000, math.max(0, luck) * 100)
+    priorityScore = priorityScore + math.min(250000, (math.log(math.max(1, price)) / math.log(10)) * 25000)
+
+    return {
+        StageId = stageId,
+        Slot = slot,
+        Item = item,
+        Special = special == true,
+        Rarity = rarity,
+        RarityRank = rank,
+        Price = price,
+        Luck = luck,
+        IndexEligible = indexEligible,
+        NewDiscovery = newDiscovery == true,
+        PriorityScore = priorityScore,
+    }
+end
+
+function P:GetRewardCandidates()
+    local candidates = {}
+    for stageId, reward in pairs(self.Run.Rewards) do
+        if type(reward) == "table" and reward.Completed == true and type(reward.Items) == "table" then
+            local specials = self.Run.Specials[stageId] or {}
+            for slot, baseItem in pairs(reward.Items) do
+                local item = baseItem
+                local isSpecial = false
+                local special = specials[slot]
+                if type(special) == "table" and type(special.Item) == "table" then
+                    item = special.Item
+                    isSpecial = true
+                end
+                if type(item) == "table" and type(item.UUID) == "string" then
+                    table.insert(candidates, self:CandidateData(stageId, slot, item, isSpecial))
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.PriorityScore ~= b.PriorityScore then
+            return a.PriorityScore > b.PriorityScore
+        end
+        if a.Luck ~= b.Luck then
+            return a.Luck > b.Luck
+        end
+        if a.Price ~= b.Price then
+            return a.Price > b.Price
+        end
+        return a.StageId > b.StageId
+    end)
+    return candidates
+end
+
+function P:CollectCandidate(candidate)
+    if type(candidate) ~= "table" or type(candidate.Item) ~= "table" then
+        return false
+    end
+    local stage = self:GetStage(candidate.StageId)
+    local spawns = stage and stage:FindFirstChild("ItemSpawns")
+    local spawnPart = spawns and spawns:FindFirstChild(candidate.Slot)
+    if not spawnPart then
+        return false
+    end
+
+    self:SetStatus(
+        string.format("Teleporting to %s%s at Stage %d", candidate.NewDiscovery and "NEW " or "", tostring(candidate.Item.Key), candidate.StageId),
+        "TP"
+    )
+    if not self:WalkToObject(spawnPart, 4.5) then
+        self.LastError = "Could not teleport to treasure slot " .. tostring(candidate.Slot) .. " at Stage " .. tostring(candidate.StageId)
+        return false
+    end
+
+    self:SetStatus(
+        string.format("Collecting %s%s from Stage %d", candidate.NewDiscovery and "NEW " or "", tostring(candidate.Item.Key), candidate.StageId),
+        "COLLECT"
+    )
+    task.wait(0.08)
+
+    local before = self:BackpackCount()
+    local ok, success = pcall(function()
+        return self.R.PickupStageTreasure:InvokeServer(candidate.StageId, candidate.Slot, candidate.Item.UUID)
+    end)
+    if ok and success then
+        local reward = self.Run.Rewards[candidate.StageId]
+        if reward and reward.Items then
+            reward.Items[candidate.Slot] = nil
+        end
+        self:WaitUntil(function()
+            return self:BackpackCount() > before or self:BackpackCount() >= self:BackpackCapacity()
+        end, 0.7, 0.03)
+        return true
+    end
+    return false
+end
+
+function P:CollectBestRewards(limit)
+    if not self.Settings.AutoCollect then
+        return 0
+    end
+    local capacity = self:BackpackCapacity()
+    local remaining = math.max(0, capacity - self:BackpackCount())
+    remaining = math.min(remaining, tonumber(limit) or remaining)
+    if remaining <= 0 then
+        return 0
+    end
+
+    local candidates = self:GetRewardCandidates()
+    if #candidates == 0 and self:HighestCleared() > 0 then
+        pcall(function()
+            self.R.RockLiftingInput:FireServer("Sync")
+        end)
+        task.wait(0.6)
+        candidates = self:GetRewardCandidates()
+    end
+
+    local collected = 0
+    for _, candidate in ipairs(candidates) do
+        if not self.Alive or not self.Settings.Enabled or collected >= remaining then
+            break
+        end
+        if self:BackpackCount() >= capacity then
+            break
+        end
+        if self:CollectCandidate(candidate) then
+            collected = collected + 1
+            task.wait(0.04)
+        end
+    end
+    return collected
+end
+
+function P:BankRun()
+    if not self.Settings.AutoBank then
+        return false
+    end
+    local previousReset = self.Run.LastReset
+    local previousBank = self.Run.LastBank
+    if not self:MoveToSpawn() then
+        return false
+    end
+    local ok = self:WaitUntil(function()
+        local backpackEmpty = self:BackpackCount() == 0
+        local banked = self.Run.LastBank > previousBank
+        local reset = self.Run.LastReset > previousReset or self:HighestCleared() == 0
+        return backpackEmpty and (banked or reset)
+    end, 4.5, 0.05)
+    if not ok then
+        -- Retrigger the bank zone by teleporting out and back in.
+        local map = self:Map()
+        local zone = map and map:FindFirstChild("SpawnZone")
+        if zone and zone:IsA("BasePart") then
+            self:SetStatus("Bank did not trigger; teleporting out and back into SpawnZone...", "RECOVER")
+            self:WalkOutOfZone(zone, 8)
+            task.wait(0.1)
+            self:WalkIntoZone(zone)
+        end
+        self:WaitUntil(function()
+            return self:BackpackCount() == 0 and (self.Run.LastBank > previousBank or self:HighestCleared() == 0)
+        end, 4, 0.05)
+    end
+    return self:BackpackCount() == 0
+end
+
+function P:SellableInventory()
+    local result = {}
+    local seen = {}
+    local inventory = self:Data().Inventory
+    if type(inventory) ~= "table" then
+        return result
+    end
+    for _, item in pairs(inventory) do
+        if type(item) == "table" then
+            local uuid = type(item.UUID) == "string" and item.UUID or tostring(item)
+            local ok, sellable = pcall(self.M.ItemUtils.IsSellable, item)
+            if ok and sellable == true and not seen[uuid] then
+                seen[uuid] = true
+                table.insert(result, item)
+            end
+        end
+    end
+    return result
+end
+
+function P:GoToShopZone(shopName)
+    local map = self:Map()
+    local shops = map and map:FindFirstChild("Shops")
+    local shop = shops and shops:FindFirstChild(shopName)
+    local zone = shop and (shop:FindFirstChild("Zone") or shop:FindFirstChild("Zone", true))
+    if zone and zone:IsA("BasePart") then
+        self:SetStatus("Teleporting to " .. tostring(shopName) .. " shop...", "TP")
+        local reached = self:WalkIntoZone(zone)
+        if reached then
+            task.wait(0.2)
+        end
+        return reached
+    end
+    self.LastError = "Missing shop zone: " .. tostring(shopName)
+    return false
+end
+
+function P:PlaceBestLuck()
+    if not self.Settings.AutoPlot then
+        return
+    end
+    local plotPart = self:GetPlotUpgradeInfo()
+    if plotPart then
+        self:SetStatus("Teleporting to plot for Best Luck placement...", "TP")
+        self:WalkToObject(plotPart, 6)
+    end
+    pcall(function()
+        self.R.PlaceBestLuck:FireServer()
+    end)
+    task.wait(0.25)
+end
+
+function P:SellInventory()
+    if not self.Settings.AutoSell then
+        return false
+    end
+    local items = self:SellableInventory()
+    if #items == 0 then
+        return false
+    end
+    if not self:GoToShopZone("Sell") then
+        return false
+    end
+    self:SetStatus("Selling " .. tostring(#items) .. " banked treasures...", "SELL")
+    local oldCount = 0
+    local oldInventory = self:Data().Inventory
+    if type(oldInventory) == "table" then
+        for _ in pairs(oldInventory) do oldCount += 1 end
+    end
+    pcall(function()
+        self.R.SellItems:FireServer(items)
+    end)
+    self:WaitUntil(function()
+        local inventory = self:Data().Inventory
+        if type(inventory) ~= "table" then return true end
+        local count = 0
+        for _ in pairs(inventory) do count += 1 end
+        return count < oldCount
+    end, 1.8, 0.05)
+    return true
+end
+
+function P:BestOwnedArmId()
+    local data = self:Data()
+    local purchased = data.PurchasedArms
+    if type(purchased) ~= "table" then
+        return nil, 1
+    end
+    local bestId = nil
+    local bestMultiplier = 1
+    for idString, owned in pairs(purchased) do
+        if owned == true then
+            local id = tonumber(idString)
+            if id then
+                local ok, multiplier = pcall(self.M.ArmsUtils.GetMultiplier, data, id)
+                multiplier = ok and tonumber(multiplier) or 1
+                if multiplier > bestMultiplier then
+                    bestMultiplier = multiplier
+                    bestId = id
+                end
+            end
+        end
+    end
+    return bestId, bestMultiplier
+end
+
+function P:GetNextArmInfo()
+    local data = self:Data()
+    local ok, nextId = pcall(self.M.ArmsUtils.GetNextUnlockId, data)
+    if not ok or not nextId then
+        return nil
+    end
+    local config = self.M.Config.Arms[nextId]
+    local cost = config and tonumber(config.UnlockCost)
+    return nextId, config, cost
+end
+
+function P:GetNextUpgradeInfo(name)
+    local ok, nextUpgrade = pcall(self.M.UpgradeUtils.GetNext, self:Data(), name)
+    if not ok or type(nextUpgrade) ~= "table" then
+        return nil
+    end
+    return nextUpgrade, tonumber(nextUpgrade.Cost)
+end
+
+function P:GetNextLockedTrainingStation()
+    local rebirths = self:CurrentRebirths()
+    local best = nil
+    for stationId, config in ipairs(self.M.Config.Training or {}) do
+        if not config.Gamepass then
+            local required = tonumber(config.RequiredRebirths) or 0
+            if required > rebirths and (not best or required < best.RequiredRebirths) then
+                best = {
+                    StationId = stationId,
+                    RequiredRebirths = required,
+                    Multiplier = tonumber(config.Multiplier) or 1,
+                }
+            end
+        end
+    end
+    return best
+end
+
+function P:RequiredBackpackCapacity()
+    local floor = math.clamp(
+        math.floor(tonumber(self.Settings.RequiredBackpackFloor) or 5),
+        3,
+        12
+    )
+    local target = math.max(
+        1,
+        tonumber(self.TargetStage) or 1,
+        tonumber(self.Route.GameROIStage) or 0,
+        self:HighestCleared() + 1
+    )
+    return math.max(3, math.min(floor, target))
+end
+
+function P:RefreshRequirementPlan()
+    local data = self:Data()
+    local cash = tonumber(data.Cash) or 0
+    local power = self:CurrentPower()
+    local plan = {
+        Kind = "None",
+        Name = "No progression blocker",
+        Detail = "Farming the best available stage",
+        Cost = 0,
+        MissingCash = 0,
+        TargetPower = 0,
+        DesiredBackpack = self:RequiredBackpackCapacity(),
+    }
+
+    if data.TutorialCompleted ~= true then
+        plan.Kind = "Tutorial"
+        plan.Name = "Complete tutorial"
+        plan.Detail = "Following tutorial progression"
+        self.Requirements = plan
+        return plan
+    end
+
+    local desiredBag = plan.DesiredBackpack
+    local currentBag = self:BackpackCapacity()
+    if self.Settings.AutoRequirements and currentBag < desiredBag then
+        local nextUpgrade, cost = self:GetNextUpgradeInfo("Backpack")
+        if nextUpgrade and cost then
+            plan.Kind = cash >= cost and "Purchase" or "Cash"
+            plan.Name = "Required Backpack"
+            plan.Detail = string.format("Capacity %d -> need at least %d", currentBag, desiredBag)
+            plan.Cost = cost
+            plan.MissingCash = math.max(0, cost - cash)
+            self.Requirements = plan
+            return plan
+        end
+    end
+
+    local nextArmId, armConfig, armCost = self:GetNextArmInfo()
+    if nextArmId and armCost and cash >= armCost then
+        plan.Kind = "Purchase"
+        plan.Name = tostring(armConfig and armConfig.DisplayName or ("Arm " .. tostring(nextArmId)))
+        plan.Detail = "Next arm multiplier is affordable"
+        plan.Cost = armCost
+        self.Requirements = plan
+        return plan
+    end
+
+    if self.Settings.AutoRebirth and self:CanRebirth() then
+        plan.Kind = "Rebirth"
+        plan.Name = "Next Rebirth"
+        plan.Detail = "Power requirement met; bank/reset first if needed"
+        self.Requirements = plan
+        return plan
+    end
+
+    local nextStation = self:GetNextLockedTrainingStation()
+    local rebirthPower = self:NextRebirthPower()
+    if self.Settings.AutoRequirements
+        and self.Settings.AutoRebirth
+        and nextStation
+        and rebirthPower
+        and nextStation.RequiredRebirths == self:CurrentRebirths() + 1
+        and rebirthPower > power then
+
+        local gapRatio = rebirthPower / math.max(1, power)
+        if gapRatio <= math.max(2.5, tonumber(self.Settings.RebirthTrainAheadRatio) or 1.18) then
+            plan.Kind = "Power"
+            plan.Name = "Unlock Training Station " .. tostring(nextStation.StationId)
+            plan.Detail = string.format(
+                "Train to %s power for Rebirth %d / station x%s",
+                self:Compact(rebirthPower),
+                nextStation.RequiredRebirths,
+                tostring(nextStation.Multiplier)
+            )
+            plan.TargetPower = math.ceil(rebirthPower)
+            self.Requirements = plan
+            return plan
+        end
+    end
+
+    if nextArmId and armCost then
+        plan.Kind = "Cash"
+        plan.Name = tostring(armConfig and armConfig.DisplayName or ("Arm " .. tostring(nextArmId)))
+        plan.Detail = "Farm cash for the next arm multiplier"
+        plan.Cost = armCost
+        plan.MissingCash = math.max(0, armCost - cash)
+        self.Requirements = plan
+        return plan
+    end
+
+    local plotObject, currentPlot, maxPlot, plotPrice, requiredRebirths = self:GetPlotUpgradeInfo()
+    if self.Settings.AutoPlot and currentPlot and currentPlot < maxPlot then
+        if self:CurrentRebirths() >= requiredRebirths then
+            plan.Kind = cash >= plotPrice and "OptionalPurchase" or "OptionalCash"
+            plan.Name = "Plot Luck Expansion"
+            plan.Detail = "Arms are maxed; improve permanent luck slots"
+            plan.Cost = plotPrice
+            plan.MissingCash = math.max(0, plotPrice - cash)
+        else
+            plan.Kind = "RebirthGate"
+            plan.Name = "Plot Expansion"
+            plan.Detail = "Needs Rebirth " .. tostring(requiredRebirths)
+        end
+    end
+
+    self.Requirements = plan
+    return plan
+end
+
+function P:ShouldReserveForNearArm(spendCost)
+    if not self.Settings.ReserveCashForNearArm then
+        return false
+    end
+
+    local _, _, armCost = self:GetNextArmInfo()
+    if not armCost then
+        return false
+    end
+
+    local cash = tonumber(self:Data().Cash) or 0
+    if cash <= 0 or armCost <= cash then
+        return false
+    end
+
+    local ratio = armCost / math.max(1, cash)
+    if ratio > (tonumber(self.Settings.NearArmReserveRatio) or 1.45) then
+        return false
+    end
+
+    return (cash - math.max(0, tonumber(spendCost) or 0)) < cash * 0.70
+end
+
+function P:ManageArms(forceTutorial)
+    if not self.Settings.AutoArms then
+        return
+    end
+    local data = self:Data()
+    local firstNextId = self.M.ArmsUtils.GetNextUnlockId(data)
+    local firstConfig = firstNextId and self.M.Config.Arms[firstNextId]
+    local firstCost = firstConfig and tonumber(firstConfig.UnlockCost)
+    local canBuy = firstCost and (tonumber(data.Cash) or 0) >= firstCost
+    if forceTutorial or canBuy then
+        if not self:GoToShopZone("Arms") then
+            return
+        end
+    end
+
+    -- ArmsUtils enforces sequential F2P unlocks. Never purchases Robux products.
+    for _ = 1, 13 do
+        data = self:Data()
+        local nextId = self.M.ArmsUtils.GetNextUnlockId(data)
+        if not nextId then
+            break
+        end
+        local config = self.M.Config.Arms[nextId]
+        local cost = config and tonumber(config.UnlockCost)
+        local cash = tonumber(data.Cash) or 0
+        if not cost or cash < cost then
+            break
+        end
+        self:SetStatus("Unlocking " .. tostring(config.DisplayName or ("Arm " .. nextId)) .. "...", "UPGRADE")
+        pcall(function()
+            self.R.ArmsAction:FireServer("Unlock", nextId)
+        end)
+        self:WaitUntil(function()
+            local purchased = self:Data().PurchasedArms
+            return type(purchased) == "table"
+                and (purchased[tostring(nextId)] == true or purchased[nextId] == true)
+        end, 1.25, 0.05)
+        task.wait(0.08)
+    end
+
+    local bestId = self:BestOwnedArmId()
+    if bestId and tonumber(self:Data().EquippedArmId) ~= tonumber(bestId) then
+        pcall(function()
+            self.R.ArmsAction:FireServer("Equip", bestId)
+        end)
+        task.wait(0.15)
+    end
+end
+
+function P:TryPurchaseUpgrade(name, budgetFraction, forceRequired)
+    local data = self:Data()
+    local nextUpgrade = self.M.UpgradeUtils.GetNext(data, name)
+    if not nextUpgrade then
+        return false
+    end
+
+    local cost = tonumber(nextUpgrade.Cost)
+    local cash = tonumber(data.Cash) or 0
+    if not cost or cash < cost then
+        return false
+    end
+
+    local required = forceRequired == true
+    local fraction = math.max(0, tonumber(budgetFraction) or 0)
+    if not required then
+        if cost > 0 and fraction > 0 and cost > cash * fraction then
+            return false
+        end
+        if self:ShouldReserveForNearArm(cost) then
+            return false
+        end
+    end
+
+    if not self:GoToShopZone("Upgrades") then
+        return false
+    end
+
+    local beforeValue
+    pcall(function()
+        beforeValue = tonumber(self.M.UpgradeUtils.GetValue(self:Data(), name))
+    end)
+
+    self:SetStatus(
+        string.format("%s %s upgrade for $%s...", required and "Buying REQUIRED" or "Buying", tostring(name), self:Compact(cost)),
+        "UPGRADE"
+    )
+
+    local ok, success = pcall(function()
+        return self.R.PurchaseUpgrade:InvokeServer(name)
+    end)
+    if not ok or success == false then
+        return false
+    end
+
+    self:WaitUntil(function()
+        local current
+        pcall(function()
+            current = tonumber(self.M.UpgradeUtils.GetValue(self:Data(), name))
+        end)
+        if beforeValue and current then
+            return current > beforeValue
+        end
+        local nextAfter = self.M.UpgradeUtils.GetNext(self:Data(), name)
+        return nextAfter ~= nextUpgrade
+    end, 1.6, 0.05)
+
+    task.wait(0.08)
+    return true
+end
+
+function P:GetPlotUpgradeInfo()
+    local userId = self.Player.UserId
+
+    if self.M.PlotController and type(self.M.PlotController.GetMyPlotModel) == "function" then
+        local ok, plot = pcall(self.M.PlotController.GetMyPlotModel)
+        if ok and plot then
+            local baseUpgrade = plot:FindFirstChild("BaseUpgrade")
+            local object = baseUpgrade and baseUpgrade:FindFirstChild("GUIPart")
+            if object and object:IsA("BasePart") then
+                local current = tonumber(object:GetAttribute("CurrentLevel"))
+                local maxLevel = tonumber(object:GetAttribute("MaxLevel")) or tonumber(self.M.Config.Plot.MaxLevel) or 20
+                local price = tonumber(object:GetAttribute("Price"))
+                local requiredRebirths = tonumber(object:GetAttribute("RequiredRebirths"))
+                if current and price and requiredRebirths then
+                    return object, current, maxLevel, price, requiredRebirths
+                end
+            end
+        end
+    end
+
+    -- Fallback for executor environments where requiring a client controller is restricted.
+    for _, object in ipairs(workspace:GetDescendants()) do
+        if object.Name == "GUIPart" and object:IsA("BasePart") and tonumber(object:GetAttribute("OwnerId")) == userId then
+            local current = tonumber(object:GetAttribute("CurrentLevel"))
+            local maxLevel = tonumber(object:GetAttribute("MaxLevel")) or tonumber(self.M.Config.Plot.MaxLevel) or 20
+            local price = tonumber(object:GetAttribute("Price"))
+            local requiredRebirths = tonumber(object:GetAttribute("RequiredRebirths"))
+            if current and price and requiredRebirths then
+                return object, current, maxLevel, price, requiredRebirths
+            end
+        end
+    end
+    return nil
+end
+
+function P:TryUpgradePlot(forceRequired)
+    if not self.Settings.AutoPlot then
+        return false
+    end
+    local object, current, maxLevel, price, requiredRebirths = self:GetPlotUpgradeInfo()
+    if not current or current >= maxLevel then
+        return false
+    end
+    local cash = tonumber(self:Data().Cash) or 0
+    local rebirths = self:CurrentRebirths()
+    if rebirths < requiredRebirths or cash < price then
+        return false
+    end
+    if forceRequired ~= true then
+        if price > 0 and price > cash * self.Settings.PlotBudgetFraction then
+            return false
+        end
+        if self:ShouldReserveForNearArm(price) then
+            return false
+        end
+    end
+    if object then
+        self:SetStatus("Teleporting to plot upgrade...", "TP")
+        if not self:WalkToObject(object, 6) then
+            return false
+        end
+    end
+    pcall(function()
+        self.R.UpgradePlot:FireServer()
+    end)
+    task.wait(0.25)
+    return true
+end
+
+function P:ManageEconomyUpgrades()
+    if not self.Settings.AutoUpgrades then
+        self:RefreshRequirementPlan()
+        return
+    end
+
+    -- 1) Arms are the strongest cash/strength progression multiplier and are always
+    --    purchased sequentially as soon as the server says they are affordable.
+    self:ManageArms(false)
+
+    -- 2) If backpack capacity itself is the current bottleneck, bypass the optional
+    --    percentage budget and buy enough tiers to reach the required floor.
+    local desiredBag = self:RequiredBackpackCapacity()
+    if self.Settings.AutoRequirements then
+        for _ = 1, 8 do
+            if self:BackpackCapacity() >= desiredBag then
+                break
+            end
+            local _, cost = self:GetNextUpgradeInfo("Backpack")
+            if not cost or (tonumber(self:Data().Cash) or 0) < cost then
+                break
+            end
+            if not self:TryPurchaseUpgrade("Backpack", self.Settings.BackpackBudgetFraction, true) then
+                break
+            end
+        end
+    end
+
+    -- Re-check arms after any reward/upgrade state change.
+    self:ManageArms(false)
+
+    -- 3) Beyond the required backpack floor, one extra capacity tier can still be
+    --    bought opportunistically when the current run target exceeds capacity.
+    if self.TargetStage > self:BackpackCapacity() then
+        self:TryPurchaseUpgrade("Backpack", self.Settings.BackpackBudgetFraction, false)
+    end
+
+    -- 4) Plot expansion is optional while arm progression remains, but once arms are
+    --    maxed it becomes the next permanent-luck progression sink and may bypass budget.
+    local nextArmId = self:GetNextArmInfo()
+    self:TryUpgradePlot(nextArmId == nil)
+
+    -- Teleport travel makes MoveSpeed non-essential. It is available only when the
+    -- user explicitly enables optional movement upgrades.
+    if self.Settings.BuyOptionalMoveSpeed then
+        self:TryPurchaseUpgrade("MoveSpeed", self.Settings.MoveSpeedBudgetFraction, false)
+    end
+
+    self:RefreshRequirementPlan()
+end
+
+function P:PerformRebirthIfReady()
+    if not self.Settings.AutoRebirth or not self:CanRebirth() then
+        return false
+    end
+    if self:BackpackCount() > 0 or self:HighestCleared() > 0 then
+        return false
+    end
+    local before = self:CurrentRebirths()
+    self:SetStatus("Rebirthing for stronger cash + strength multipliers...", "REBIRTH")
+    pcall(function()
+        self.R.PerformRebirth:FireServer()
+    end)
+    local changed = self:WaitUntil(function()
+        return self:CurrentRebirths() > before
+    end, 2.5, 0.05)
+    return changed == true
+end
+
+function P:ClaimFreeRewards()
+    if os.clock() - self.LastFreeClaim < 20 then
+        return
+    end
+    self.LastFreeClaim = os.clock()
+
+    if self.Settings.AutoOfflineReward then
+        local cash = tonumber(self.Player:GetAttribute("OfflineRewardCash")) or 0
+        local power = tonumber(self.Player:GetAttribute("OfflineRewardPower")) or 0
+        local seconds = tonumber(self.Player:GetAttribute("OfflineRewardSeconds")) or 0
+        if seconds > 0 and (cash > 0 or power > 0) then
+            pcall(function()
+                self.R.CollectOfflineRewards:FireServer()
+            end)
+            task.wait(0.25)
+        end
+    end
+
+    if self.Settings.AutoGroupReward and self:Data().ClaimedGroupReward ~= true then
+        pcall(function()
+            self.R.ClaimGroupReward:FireServer()
+        end)
+    end
+end
+
+function P:EconomyPass()
+    self:SetStatus("Optimizing required progression, inventory, arms and upgrades...", "ECONOMY")
+    self:RefreshRequirementPlan()
+    self:ClaimFreeRewards()
+
+    -- Fill existing luck stands before selling anything.
+    self:PlaceBestLuck()
+    self:SellInventory()
+
+    -- New cash may unlock an arm/plot/backpack tier.
+    self:ManageEconomyUpgrades()
+
+    -- A newly expanded plot can accept another best-luck placement on the next pass immediately.
+    self:PlaceBestLuck()
+
+    if self:PerformRebirthIfReady() then
+        self:ManageArms(false)
+    end
+    self:RefreshRequirementPlan()
+    self.LastEconomyAt = os.clock()
+end
+
+function P:TutorialPass()
+    local data = self:Data()
+    if data.TutorialCompleted == true then
+        return true
+    end
+    local step = tonumber(data.TutorialStep) or 1
+    self:SetStatus("Completing tutorial step " .. tostring(step) .. "/5...", "TUTORIAL")
+
+    if step == 1 then
+        -- The global tap loop handles the five required training taps.
+        self:WaitUntil(function()
+            local d = self:Data()
+            return d.TutorialCompleted == true or tonumber(d.TutorialStep) ~= 1
+        end, 8, 0.08)
+        return false
+    end
+
+    if step == 2 then
+        self:LiftStage(1)
+        return false
+    end
+
+    if step == 3 then
+        local stageId = tonumber(data.TutorialLiftStageId) or math.max(1, self:HighestCleared())
+        self:CollectBestRewards(1)
+        if self:Data().TutorialReturnPending == true or self:BackpackCount() > 0 then
+            self:BankRun()
+        end
+        return false
+    end
+
+    if step == 4 then
+        self:SellInventory()
+        self:WaitUntil(function()
+            local d = self:Data()
+            return d.TutorialCompleted == true or tonumber(d.TutorialStep) ~= 4
+        end, 3, 0.08)
+        return false
+    end
+
+    if step == 5 then
+        self:ManageArms(true)
+        self:WaitUntil(function()
+            local d = self:Data()
+            return d.TutorialCompleted == true or tonumber(d.TutorialStep) ~= 5
+        end, 4, 0.08)
+        return false
+    end
+
+    task.wait(0.3)
+    return false
+end
+
+function P:RunProgressionCycle()
+    -- A fresh injection can race the server snapshot. Synchronize before deciding that a partial
+    -- backpack has no live run behind it, otherwise entering SpawnZone could erase recoverable rewards.
+    self:EnsureRunSynced()
+
+    local backpackCount = self:BackpackCount()
+    local capacity = self:BackpackCapacity()
+    local clearedNow = self:HighestCleared()
+
+    if backpackCount > 0 then
+        if not self.Settings.AutoBank then
+            self:SetStatus("Unbanked treasure is waiting because Auto Bank is disabled", "PAUSED")
+            task.wait(0.4)
+            return
+        end
+
+        if backpackCount >= capacity or clearedNow == 0 then
+            if not self:BankRun() then
+                self:SetStatus("Could not bank yet; retaining unbanked treasure and retrying...", "RECOVER")
+                task.wait(0.4)
+                return
+            end
+            backpackCount = 0
+            clearedNow = self:HighestCleared()
+        else
+            -- Resume the existing run. The remaining capacity can be filled from uncollected rewards
+            -- or higher stages instead of throwing away the cleared-state work after a reload/lag spike.
+            self:SetStatus(
+                string.format("Resuming live run with %d/%d treasure already collected", backpackCount, capacity),
+                "RECOVER"
+            )
+        end
+    end
+
+    if clearedNow == 0 and self:BackpackCount() == 0 then
+        self:EconomyPass()
+    end
+
+    if self.Settings.AutoRebirth and self:CanRebirth() then
+        self:PerformRebirthIfReady()
+        return
+    end
+
+    local trainingTarget, trainingReason = self:ChooseTrainingTarget()
+    if trainingTarget and trainingTarget > self:CurrentPower() then
+        self:TrainToPower(trainingTarget, trainingReason)
+        if self.Settings.AutoRebirth and self:CanRebirth() then
+            self:PerformRebirthIfReady()
+            return
+        end
+    end
+
+    local target = self:ChooseTargetStage()
+    if target <= 0 then
+        local needed = math.ceil(self:GetStageWeight(1) / math.max(0.1, self.Settings.MaxLiftSeconds))
+        self:TrainToPower(needed, "first efficient rock")
+        return
+    end
+    self.TargetStage = target
+
+    local stageId = 1
+    while self.Alive and self.Settings.Enabled and stageId <= self:GetMaxStage() do
+        if self:IsStageCleared(stageId) then
+            stageId = stageId + 1
+        else
+            -- Re-evaluate after every stage because constant training during lifting can make another stage efficient.
+            target = math.max(target, self:ChooseTargetStage())
+            self.TargetStage = target
+            if stageId > target then
+                break
+            end
+            local lifted = self:LiftStage(stageId)
+            if not lifted then
+                break
+            end
+            stageId = stageId + 1
+        end
+    end
+
+    local cleared = self:HighestCleared()
+    if cleared > 0 then
+        self:RefreshSpecialSpawns(true)
+        if not self.Settings.AutoCollect then
+            self:SetStatus("Stage rewards are waiting because Auto Collect is disabled", "PAUSED")
+            task.wait(0.4)
+            return
+        end
+
+        self:SetStatus("Selecting the best treasure from cleared stages...", "COLLECT")
+        local collected = self:CollectBestRewards(self:BackpackCapacity())
+
+        if self.Settings.AutoBank then
+            if self:BackpackCount() > 0 then
+                if not self:BankRun() then
+                    self:SetStatus("Bank retry needed; retaining the current run", "RECOVER")
+                    task.wait(0.4)
+                    return
+                end
+            elseif #self:GetRewardCandidates() > 0 then
+                -- Do not enter SpawnZone and erase a run when pickup failed transiently.
+                self:SetStatus("Pickup did not confirm; retaining rewards and retrying instead of resetting", "RECOVER")
+                pcall(function()
+                    self.R.RockLiftingInput:FireServer("Sync")
+                end)
+                task.wait(0.65)
+                return
+            else
+                -- An empty reward set can be reset safely.
+                self:BankRun()
+            end
+        else
+            self:SetStatus("Collected " .. tostring(collected) .. " treasure; Auto Bank is disabled", "PAUSED")
+            task.wait(0.4)
+            return
+        end
+
+        if self:HighestCleared() == 0 and self:BackpackCount() == 0 then
+            self:EconomyPass()
+        end
+    else
+        task.wait(0.25)
+    end
+end
+
+function P:Compact(value)
+    value = tonumber(value) or 0
+    local abs = math.abs(value)
+    local units = {
+        {1e18, "Qi"},
+        {1e15, "Qa"},
+        {1e12, "T"},
+        {1e9, "B"},
+        {1e6, "M"},
+        {1e3, "K"},
+    }
+    for _, unit in ipairs(units) do
+        if abs >= unit[1] then
+            local scaled = value / unit[1]
+            if math.abs(scaled) >= 100 then
+                return string.format("%.0f%s", scaled, unit[2])
+            elseif math.abs(scaled) >= 10 then
+                return string.format("%.1f%s", scaled, unit[2])
+            end
+            return string.format("%.2f%s", scaled, unit[2])
+        end
+    end
+    if value == math.floor(value) then
+        return tostring(math.floor(value))
+    end
+    return string.format("%.2f", value)
+end
+
+function P:InstallTapLoop()
+    self:Spawn(function()
+        while self.Alive do
+            if self.Settings.Enabled and self.Settings.AutoTrain then
+                local rate = math.clamp(tonumber(self.Settings.TapRate) or 27, 1, 29)
+                if self.Run.Session then
+                    -- Stock RockLiftingController adds about 2/s; reserve headroom under the 30/s token bucket.
+                    rate = math.min(rate, 27)
+                end
+                pcall(function()
+                    self.R.TrainingTap:FireServer(Vector2.new(0.5, 0.5))
+                end)
+                task.wait(1 / rate)
+            else
+                task.wait(0.15)
+            end
+        end
+    end)
+end
+
+function P:InstallAntiAFK()
+    self:Connect(self.Player.Idled, function()
+        if not self.Alive or not self.Settings.AntiAFK then
+            return
+        end
+        pcall(function()
+            self.S.VirtualUser:CaptureController()
+            self.S.VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+            task.wait(0.05)
+            self.S.VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        end)
+    end)
+end
+
+function P:CreateUI()
+    local PuckUIUrl = "https://raw.githubusercontent.com/PuckAFK/Puck-Loader/refs/heads/main/ui/PuckUI.lua"
+    local okSource, source = pcall(function()
+        return game:HttpGet(PuckUIUrl)
+    end)
+    if not okSource or type(source) ~= "string" or source == "" then
+        error("[PuckAFK Lift Rock] Could not download PuckUI: " .. tostring(source))
+    end
+
+    local loader, compileError = loadstring(source)
+    if not loader then
+        error("[PuckAFK Lift Rock] Could not compile PuckUI: " .. tostring(compileError))
+    end
+    local okUI, PuckUI = pcall(loader)
+    if not okUI or type(PuckUI) ~= "table" then
+        error("[PuckAFK Lift Rock] Could not initialize PuckUI: " .. tostring(PuckUI))
+    end
+
+    local window = PuckUI:CreateWindow({
+        Name = "PuckAFK | Lift Rock for Treasure",
+        GuiName = "PuckAFK_LiftRock",
+        Width = 560,
+        Height = 500,
+        ConfigId = "LiftRockForTreasure",
+        Configs = {
+            AutoSave = true,
+            AutoLoad = true,
+            DefaultProfile = "default",
+        },
+    })
+    window.CloseCallback = function()
+        self:Shutdown()
+    end
+
+    self.UI.Library = PuckUI
+    self.UI.Window = window
+
+    local function bindToggle(tab, name, key, extra)
+        return tab:CreateToggle({
+            Name = name,
+            CurrentValue = self.Settings[key] == true,
+            Flag = "LiftRock." .. key,
+            Callback = function(value)
+                self.Settings[key] = value == true
+                if key == "Enabled" and not self.Settings.Enabled then
+                    self:StopWalking()
+                end
+                if type(extra) == "function" then
+                    extra(value == true)
+                end
+            end,
+        })
+    end
+
+    local function bindSlider(tab, name, key, range, increment, suffix)
+        return tab:CreateSlider({
+            Name = name,
+            Range = range,
+            Increment = increment,
+            CurrentValue = self.Settings[key],
+            Suffix = suffix or "",
+            Flag = "LiftRock." .. key,
+            Callback = function(value)
+                self.Settings[key] = value
+            end,
+        })
+    end
+
+    local function stopWhenDisabled(enabled)
+        if not enabled then
+            self:StopWalking()
+        end
+    end
+
+    local function friendlyStatus(text)
+        text = tostring(text or "Ready")
+        local replacements = {
+            {"Synchronizing current rock run%.%.%.", "Preparing..."},
+            {"Optimizing required progression, inventory, arms and upgrades%.%.%.", "Checking upgrades..."},
+            {"Teleporting to ", "Moving to "},
+            {"teleporting to ", "moving to "},
+            {"Bank did not trigger; moving out and back into SpawnZone%.%.%.", "Retrying bank..."},
+            {"Bank did not trigger; teleporting out and back into SpawnZone%.%.%.", "Retrying bank..."},
+            {"Could not bank yet; retaining unbanked treasure and retrying%.%.%.", "Retrying bank..."},
+            {"Pickup did not confirm; retaining rewards and retrying instead of resetting", "Retrying treasure pickup..."},
+            {"Main loop crashed %- see console", "Recovering..."},
+            {"Installing remote observers%.%.%.", "Starting..."},
+            {"Starting training loop%.%.%.", "Starting..."},
+            {"Installing anti%-AFK%.%.%.", "Starting..."},
+            {"Synchronizing special spawns%.%.%.", "Starting..."},
+            {"Loading PuckUI%.%.%.", "Starting..."},
+            {"Starting progression brain%.%.%.", "Starting..."},
+        }
+        for _, pair in ipairs(replacements) do
+            text = text:gsub(pair[1], pair[2])
+        end
+        return text
+    end
+
+    local function friendlyGoal(plan)
+        plan = plan or {}
+        local name = tostring(plan.Name or "Keep farming")
+        local detail = tostring(plan.Detail or "")
+
+        if name == "No progression blocker" then
+            return "Keep farming", "Working on the best available treasure route."
+        elseif name == "Complete tutorial" then
+            return "Finish tutorial", "Completing the starter steps automatically."
+        elseif name == "Required Backpack" then
+            return "Upgrade backpack", "More space is needed before progressing efficiently."
+        elseif name == "Next Rebirth" then
+            return "Rebirth", "Ready to rebirth for stronger permanent multipliers."
+        elseif name:match("^Unlock Training Station") then
+            return "Unlock better training", "Building enough strength for the next rebirth and training area."
+        elseif name == "Plot Luck Expansion" then
+            return "Upgrade plot luck", "Improving permanent treasure luck."
+        elseif name == "Plot Expansion" then
+            return "Unlock plot upgrade", detail ~= "" and detail or "A higher rebirth is needed first."
+        elseif plan.Kind == "Cash" or plan.Kind == "Purchase" then
+            return "Next upgrade: " .. name, plan.MissingCash and plan.MissingCash > 0
+                and ("Saving $" .. self:Compact(plan.MissingCash) .. " more")
+                or "Buying it when ready."
+        elseif plan.Kind == "Power" then
+            return "Build more strength", detail ~= "" and detail or "Training for the next progression step."
+        end
+
+        return name, detail ~= "" and detail or "Continuing automatic progression."
+    end
+
+    local home = window:CreateTab("Home")
+    home:CreateSection("Overview")
+    local statusCard = home:CreateParagraph({
+        Title = "Status",
+        Content = "Starting...",
+        Height = 58,
+    })
+    local progressCard = home:CreateParagraph({
+        Title = "Progress",
+        Content = "Loading your progress...",
+        Height = 76,
+    })
+    local goalCard = home:CreateParagraph({
+        Title = "Next Goal",
+        Content = "Choosing the best next step...",
+        Height = 62,
+    })
+
+    home:CreateSection("Main Control")
+    bindToggle(home, "Smart Autofarm", "Enabled")
+
+    local farm = window:CreateTab("Farming")
+    farm:CreateSection("Automatic Farming")
+    bindToggle(farm, "Auto Train", "AutoTrain", stopWhenDisabled)
+    bindToggle(farm, "Auto Lift Rocks", "AutoLift", stopWhenDisabled)
+    bindToggle(farm, "Auto Collect Treasure", "AutoCollect", stopWhenDisabled)
+    bindToggle(farm, "Auto Bank Treasure", "AutoBank", stopWhenDisabled)
+    bindToggle(farm, "Auto Special Treasure", "AutoSpecialSpawns")
+
+    farm:CreateSection("Smart Choices")
+    bindToggle(farm, "Smart Stage Selection", "AdaptiveROI")
+    bindToggle(farm, "Prioritize New Treasures", "IndexPriority")
+    bindSlider(farm, "Training Speed", "TapRate", {5, 29}, 1, "/s")
+
+    local upgrades = window:CreateTab("Upgrades")
+    upgrades:CreateSection("Progression")
+    bindToggle(upgrades, "Auto Sell", "AutoSell", stopWhenDisabled)
+    bindToggle(upgrades, "Auto Best Arms", "AutoArms", stopWhenDisabled)
+    bindToggle(upgrades, "Auto Backpack & Useful Upgrades", "AutoUpgrades", stopWhenDisabled)
+    bindToggle(upgrades, "Auto Buy Needed Progression", "AutoRequirements")
+    bindToggle(upgrades, "Auto Rebirth", "AutoRebirth")
+    bindToggle(upgrades, "Auto Plot Luck", "AutoPlot", stopWhenDisabled)
+
+    upgrades:CreateSection("Rewards")
+    bindToggle(upgrades, "Claim Offline Rewards", "AutoOfflineReward")
+    bindToggle(upgrades, "Claim Group Reward", "AutoGroupReward")
+
+    local settingsTab = window:CreateTab("Settings")
+    settingsTab:CreateSection("General")
+    bindToggle(settingsTab, "Anti AFK", "AntiAFK")
+    settingsTab:CreateButton({
+        Name = "Unload Script",
+        Callback = function()
+            self:Shutdown()
+        end,
+    })
+
+    self.UI.Status = statusCard
+    self.UI.Stats = progressCard
+    self.UI.Goal = goalCard
+
+    self:Spawn(function()
+        while self.Alive and self.UI.Window and self.UI.Window.ScreenGui and self.UI.Window.ScreenGui.Parent do
+            local data = self:Data()
+            local _, armMulti = self:BestOwnedArmId()
+            local plan = self:RefreshRequirementPlan()
+            local goalTitle, goalText = friendlyGoal(plan)
+
+            statusCard:Set({
+                Title = "Status",
+                Content = friendlyStatus(self.Status),
+            })
+
+            progressCard:Set({
+                Title = "Progress",
+                Content = string.format(
+                    "Strength %s   •   Cash $%s\nRebirths %s   •   Arm x%s   •   Backpack %d/%d",
+                    self:Compact(data.Power or 0),
+                    self:Compact(data.Cash or 0),
+                    self:Compact(data.Rebirths or 0),
+                    self:Compact(armMulti or 1),
+                    self:BackpackCount(),
+                    self:BackpackCapacity()
+                ),
+            })
+
+            goalCard:Set({
+                Title = goalTitle,
+                Content = goalText,
+            })
+
+            task.wait(0.35)
+        end
+    end)
+
+    PuckUI:Notify({
+        Title = "PuckAFK",
+        Content = "Lift Rock is ready",
+        Duration = 2.5,
+    })
+end
+
+function P:MainLoop()
+    self:SetStatus("Synchronizing current rock run...", "SYNC")
+    self:EnsureRunSynced()
+    self:SetStatus("Ready", "IDLE")
+    while self.Alive do
+        if not self.Settings.Enabled then
+            self:SetStatus("Paused", "PAUSED")
+            task.wait(0.25)
+        else
+            local ok, err = pcall(function()
+                if self:Data().TutorialCompleted ~= true then
+                    self:TutorialPass()
+                else
+                    self:RunProgressionCycle()
+                end
+            end)
+            if not ok then
+                self.LastError = tostring(err)
+                warn("[PuckAFK Lift Rock] cycle error: " .. tostring(err))
+                pcall(function()
+                    self.R.RockLiftingInput:FireServer("Sync")
+                end)
+                task.wait(0.75)
+            else
+                self.LastError = nil
+                task.wait(0.05)
+            end
+        end
+    end
+end
+
+function P:Shutdown(silent)
+    if not self.Alive then
+        return
+    end
+    self.Alive = false
+    self.Settings.Enabled = false
+    self:StopWalking()
+    for _, connection in ipairs(self.Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(self.Connections)
+    if self.UI.Window then
+        local window = self.UI.Window
+        self.UI.Window = nil
+        pcall(function()
+            window:Destroy()
+        end)
+    end
+    pcall(function()
+        if self.Run.Session and self.Run.Session.SessionId then
+            self.R.RockLiftingInput:FireServer("Stop", self.Run.Session.SessionId)
+        end
+    end)
+    if ENV.PuckAFK_LiftRock == self then
+        ENV.PuckAFK_LiftRock = nil
+    end
+    if not silent then
+        warn("[PuckAFK Lift Rock] Unloaded")
+    end
+end
+
+-- v1.4.0 boot fix: v1.3.0 accidentally ended after defining Shutdown(), so none of
+-- the observers, tap loop, anti-AFK, PuckUI, or main progression loop ever started.
+-- Keep boot in one guarded block so a future game/UI change reports the real error
+-- and does not leave a half-alive instance in getgenv().
+local function Bootstrap()
+    P:SetStatus("Installing remote observers...", "BOOT")
+    P:InstallRemoteObservers()
+
+    P:SetStatus("Starting training loop...", "BOOT")
+    P:InstallTapLoop()
+
+    P:SetStatus("Installing anti-AFK...", "BOOT")
+    P:InstallAntiAFK()
+
+    P:SetStatus("Synchronizing special spawns...", "BOOT")
+    P:RefreshSpecialSpawns(true)
+
+    P:SetStatus("Loading PuckUI...", "BOOT")
+    P:CreateUI()
+
+    P:SetStatus("Starting progression brain...", "BOOT")
+    P:Spawn(function()
+        local ok, err = pcall(function()
+            P:MainLoop()
+        end)
+        if not ok and P.Alive then
+            P.LastError = tostring(err)
+            warn("[PuckAFK Lift Rock] main loop crashed: " .. tostring(err))
+            P:SetStatus("Main loop crashed - see console", "ERROR")
+        end
+    end)
+
+    print("[PuckAFK Lift Rock] Smart AutoFarm v" .. P.Version .. " loaded")
+end
+
+local bootOk, bootErr = pcall(Bootstrap)
+if not bootOk then
+    local message = tostring(bootErr)
+    P.LastError = message
+    warn("[PuckAFK Lift Rock] BOOT FAILED: " .. message)
+
+    -- Clean up workers/connections created before the failure without producing
+    -- a misleading extra 'Unloaded' warning.
+    pcall(function()
+        P:Shutdown(true)
+    end)
+
+    if ENV.PuckAFK_LiftRock == P then
+        ENV.PuckAFK_LiftRock = nil
+    end
+end
+
