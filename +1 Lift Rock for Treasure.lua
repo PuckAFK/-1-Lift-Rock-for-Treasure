@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.3 - Ultra Fast Smooth Tween + Rarity Filter
+    Smart AutoFarm v1.7.4 - Farming Speed + Strict Rarity Filter
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -15,7 +15,9 @@
       * Backpack capacity
       * Always sort live treasures by the game's rarity ranks, including Ethereal / Exclusive
       * Visual-ground/live-server reconciliation, stale-UUID protection and per-pick re-ranking
-      * Configurable minimum treasure rarity, Divine above Celestial, filtering before pickup
+      * Strict persisted rarity filtering: Divine above Celestial, verified before each pickup
+      * No matching treasure: skip inferior drops and reroll cleared run (if Auto Bank enabled)
+      * Tween Speed relocated to Farming, with a fresh config key that ignores obsolete saved speeds
       * Special timed stage spawns
       * Sellable/protected item rules
       * Place Best Luck plot action
@@ -76,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.3",
+    Version = "1.7.4",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -154,7 +156,7 @@ P.Settings = {
     -- is restored on route completion, pause, respawn, error, and unload.
     WalkAcceptanceRadius = 2.75,
     PathRetries = 4,
-    TweenSpeed = 600, -- Ultra-fast default; adjustable in Settings from 20 to 750 studs/s.
+    TweenSpeed = 600, -- New Farming-tab setting; legacy saved Settings speed is ignored. 20-750 studs/s.
     TweenWaypointSpacing = 8,
 
     -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
@@ -2098,7 +2100,10 @@ function P:RarityRank(item)
             rarity = definition.Rarity
         end
     end
-    if item and item.ItemType == "Treasure" and item.Key then
+    -- Ground snapshots can carry ItemType=nil and a stale Rarity value.
+    -- The treasure catalog keyed by item.Key is the authoritative tier for
+    -- treasure rewards regardless of whether ItemType was serialized.
+    if item and (item.ItemType == nil or item.ItemType == "Treasure") and item.Key then
         local treasure = self.M.Config.Treasures or {}
         local key = (treasure.KeyAliases or {})[item.Key] or item.Key
         local configured = (treasure.Items or {})[key]
@@ -2140,12 +2145,11 @@ function P:PickupAllowed(candidate)
     if not candidate then
         return false
     end
-    -- Tutorial requires its first pickup; don't soft-lock a fresh player who
-    -- saved a Divine+ filter from another session.
-    if self:Data().TutorialCompleted ~= true then
-        return true
-    end
-    return candidate.RarityRank >= self:MinimumRarityRank()
+    -- This gate is authoritative for ALL pick requests, including the tutorial.
+    -- A strict Divine+ filter should never silently collect a Celestial.
+    -- New players may need to switch to Any for the mandatory tutorial pickup.
+    local selectedRank = self:MinimumRarityRank()
+    return (tonumber(candidate.RarityRank) or 0) >= selectedRank
 end
 
 function P:CandidateData(stageId, slot, item, special)
@@ -2347,6 +2351,15 @@ function P:CollectCandidate(candidate)
     if visible and visible.UUID ~= candidate.Item.UUID
         and not (type(special) == "table" and type(special.Item) == "table"
             and special.Item.UUID == candidate.Item.UUID) then
+        return false
+    end
+
+    -- HARD CHECK: even if rarity/config changed during travel or a snapshot was
+    -- stale, do not send a pickup request for anything below the selected tier.
+    local currentRank, currentRarity = self:RarityRank(visible or candidate.Item)
+    if not self:PickupAllowed({RarityRank = currentRank}) then
+        self.LastError = string.format("Skipped %s treasure (minimum %s)",
+            tostring(currentRarity), tostring(self.Settings.MinPickupRarity or "Any"))
         return false
     end
 
@@ -3065,6 +3078,11 @@ function P:TutorialPass()
 
     if step == 3 then
         local stageId = tonumber(data.TutorialLiftStageId) or math.max(1, self:HighestCleared())
+        if #self:GetRewardCandidates() == 0 and self:MinimumRarityRank() > 0 then
+            self:SetStatus("Tutorial: set Minimum Rarity to Any to collect the required first treasure", "FILTER")
+            task.wait(0.4)
+            return false
+        end
         self:CollectBestRewards(1)
         if self:Data().TutorialReturnPending == true or self:BackpackCount() > 0 then
             self:BankRun()
@@ -3187,8 +3205,12 @@ function P:RunProgressionCycle()
 
         if collected == 0 and self:BackpackCount() == 0
             and #self:GetRewardCandidates() == 0 and self:MinimumRarityRank() > 0 then
-            self:SetStatus("No eligible " .. tostring(self.Settings.MinPickupRarity)
-                .. "+ treasure this run - rerolling", "FILTER")
+            local minimum = tostring(self.Settings.MinPickupRarity)
+            if self.Settings.AutoBank then
+                self:SetStatus("No " .. minimum .. "+ treasure: skipping lower tiers and rerolling", "FILTER")
+            else
+                self:SetStatus("No " .. minimum .. "+ treasure: waiting (enable Auto Bank to reroll)", "FILTER")
+            end
         end
 
         if self.Settings.AutoBank then
@@ -3465,16 +3487,46 @@ function P:CreateUI()
         CurrentOption = tostring(self.Settings.MinPickupRarity or "Any"),
         Flag = "LiftRock.MinPickupRarity",
         Callback = function(value)
-            if type(value) == "string" then
+            -- PuckUI sends {selectedOption}, including when loading a saved profile.
+            -- v1.7.1-1.7.3 ignored this table, leaving the setting stuck at Any.
+            if type(value) == "table" then
+                value = value[1]
+            end
+            local available = {
+                Any = true, Common = true, Uncommon = true, Rare = true,
+                Epic = true, Legendary = true, Mythic = true, Secret = true,
+                Celestial = true, Divine = true, Ethereal = true, Exclusive = true,
+            }
+            if type(value) == "string" and available[value] then
                 self.Settings.MinPickupRarity = value
+                self:SetStatus("Minimum treasure rarity: " .. value, "FILTER")
             end
         end,
     })
     farm:CreateParagraph({
-        Title = "Priority",
-        Content = "Always highest rarity first. Divine outranks Celestial. "
-            .. "Setting Divine skips Celestial and below; skipped treasure is rerolled.",
-        Height = 54,
+        Title = "Rarity Filter",
+        Content = "Only collect the chosen rarity OR higher. Divine skips Celestial. "
+            .. "If none appear, Auto Bank resets the run to try again. "
+            .. "Set Any for the mandatory tutorial pickup.",
+        Height = 68,
+    })
+    farm:CreateSection("Farming Speed")
+    farm:CreateSlider({
+        Name = "Smooth Tween Speed",
+        Range = {20, 750},
+        Increment = 10,
+        CurrentValue = self.Settings.TweenSpeed,
+        Suffix = " studs/s",
+        -- New unique config identity: never autoload an old Settings.TweenSpeed
+        -- profile entry, including stale speeds from v1.7.2/v1.7.3.
+        Flag = "LiftRock.FarmingTweenSpeedV174",
+        ConfigKey = "FarmingTweenSpeedV174",
+        Callback = function(value)
+            -- PuckUI sliders send a number. Keep strict bounds for corrupted files.
+            if type(value) == "table" then value = value[1] end
+            local n = tonumber(value)
+            if n then self.Settings.TweenSpeed = math.clamp(n, 20, 750) end
+        end,
     })
     bindSlider(farm, "Training Speed", "TapRate", {5, 29}, 1, "/s")
 
@@ -3494,8 +3546,6 @@ function P:CreateUI()
     local settingsTab = window:CreateTab("Settings")
     settingsTab:CreateSection("General")
     bindToggle(settingsTab, "Anti AFK", "AntiAFK")
-    settingsTab:CreateSection("Movement")
-    bindSlider(settingsTab, "Fast Smooth Tween Speed", "TweenSpeed", {20, 750}, 10, " studs/s")
     settingsTab:CreateButton({
         Name = "Unload Script",
         Callback = function()
