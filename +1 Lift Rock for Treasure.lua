@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.0 - UPD New Stages + Best Loot
+    Smart AutoFarm v1.7.1 - Safe Tween + Rarity Filter
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -15,7 +15,7 @@
       * Backpack capacity
       * Always sort live treasures by the game's rarity ranks, including Ethereal / Exclusive
       * Visual-ground/live-server reconciliation, stale-UUID protection and per-pick re-ranking
-      * Index discovery priority only INSIDE a rarity tier, never above genuinely rarer treasure
+      * Configurable minimum treasure rarity, Divine above Celestial, filtering before pickup
       * Special timed stage spawns
       * Sellable/protected item rules
       * Place Best Luck plot action
@@ -28,7 +28,7 @@
       * Death / reset / stalled lift recovery
       * Game-native StoneIncome ROI model blended with live-run limits
       * Snapshot progress recovery and stale special-spawn removal
-      * Instant teleport travel to lift / training / sell / arms / upgrades / plot targets
+      * Collision-aware, path-routed safe tween travel to lift / training / shops / plot
       * Mid-run/reload recovery without prematurely banking a partially filled backpack
       * Authoritative special-spawn snapshot rebuild with revision-safe delta handling
       * Requirement-aware progression purchases that bypass optional budgets when actually needed
@@ -75,7 +75,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.0",
+    Version = "1.7.1",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -148,10 +148,16 @@ P.Settings = {
     PushNewStages = true,
     AntiAFK = true,
 
-    -- Teleport movement. Interactions still use the game's real zones/remotes and verify
-    -- the resulting server state before progression continues.
-    TeleportSettleDelay = 0.055,
-    TeleportRetries = 3,
+    -- Server-verified pathfinding + smooth tween movement; no instant teleport.
+    -- The HRP is temporarily collision-isolated during each safe segment; all collision states
+    -- are restored on arrival, pause, respawn, error, and unload to prevent flinging.
+    WalkAcceptanceRadius = 2.75,
+    PathRetries = 4,
+    TweenSpeed = 32,
+    TweenWaypointSpacing = 8,
+
+    -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
+    MinPickupRarity = "Any",
 
     -- Progression requirement brain. "Required" upgrades can bypass the optional spending
     -- budgets below when they are the current bottleneck.
@@ -184,7 +190,7 @@ P.Settings = {
     -- Economy spending budgets. Arms are always first priority when the next arm is affordable.
     BackpackBudgetFraction = 0.12,
     PlotBudgetFraction = 0.15,
-    -- MoveSpeed does not affect teleport travel, so it is optional and disabled by default.
+    -- Tween travel is independent of character WalkSpeed, so this is optional.
     MoveSpeedBudgetFraction = 0.08,
 }
 
@@ -192,6 +198,8 @@ P.S = {
     Players = game:GetService("Players"),
     ReplicatedStorage = game:GetService("ReplicatedStorage"),
     CollectionService = game:GetService("CollectionService"),
+    PathfindingService = game:GetService("PathfindingService"),
+    TweenService = game:GetService("TweenService"),
     VirtualUser = game:GetService("VirtualUser"),
 }
 P.Player = P.S.Players.LocalPlayer
@@ -383,50 +391,36 @@ function P:ProjectToGround(worldPosition, extraExclude)
     return worldPosition
 end
 
-function P:GetZoneTeleportCFrame(zone)
+function P:GetZoneWalkPoint(zone)
     if not zone or not zone:IsA("BasePart") then
-        return nil
+        return self:ObjectPosition(zone)
     end
-
     local _, _, root = self:GetCharacter()
+    if not root then
+        return self:ProjectToGround(zone.Position, zone)
+    end
+
     local half = zone.Size * 0.5
-    local localRoot = root and zone.CFrame:PointToObjectSpace(root.Position) or Vector3.zero
+    local localRoot = zone.CFrame:PointToObjectSpace(root.Position)
+    local insetX = math.min(math.max(1.25, half.X * 0.18), math.max(0.1, half.X - 0.1))
+    local insetZ = math.min(math.max(1.25, half.Z * 0.18), math.max(0.1, half.Z - 0.1))
+    local minX, maxX = -half.X + insetX, half.X - insetX
+    local minZ, maxZ = -half.Z + insetZ, half.Z - insetZ
+    if minX > maxX then minX, maxX = 0, 0 end
+    if minZ > maxZ then minZ, maxZ = 0, 0 end
 
-    -- Enter near the closest interior edge rather than the geometric centre. Lift zones
-    -- commonly wrap a physical rock, so edge entry avoids spawning inside the rock mesh.
-    local marginX = math.min(math.max(0.8, half.X * 0.16), math.max(0.05, half.X - 0.05))
-    local marginZ = math.min(math.max(0.8, half.Z * 0.16), math.max(0.05, half.Z - 0.05))
-    local edgeX = math.max(0, half.X - marginX)
-    local edgeZ = math.max(0, half.Z - marginZ)
-
-    local normalizedX = math.abs(localRoot.X) / math.max(half.X, 0.1)
-    local normalizedZ = math.abs(localRoot.Z) / math.max(half.Z, 0.1)
-
-    local x, z
-    if normalizedX >= normalizedZ then
-        x = (localRoot.X >= 0 and 1 or -1) * edgeX * 0.88
-        z = math.clamp(localRoot.Z, -edgeZ * 0.70, edgeZ * 0.70)
-    else
-        z = (localRoot.Z >= 0 and 1 or -1) * edgeZ * 0.88
-        x = math.clamp(localRoot.X, -edgeX * 0.70, edgeX * 0.70)
-    end
-
-    local point = zone.CFrame:PointToWorldSpace(Vector3.new(x or 0, 0, z or 0))
-    local look = root and root.CFrame.LookVector or zone.CFrame.LookVector
-    local flatLook = Vector3.new(look.X, 0, look.Z)
-    if flatLook.Magnitude < 0.05 then
-        flatLook = Vector3.new(0, 0, -1)
-    else
-        flatLook = flatLook.Unit
-    end
-    return CFrame.lookAt(point, point + flatLook, Vector3.yAxis)
+    -- Clamp to the nearest interior point and stay near the entry side. Going too
+    -- far toward the centre can put the goal inside the rock/shop model itself.
+    local x = math.clamp(localRoot.X, minX, maxX) * 0.90
+    local z = math.clamp(localRoot.Z, minZ, maxZ) * 0.90
+    local raw = zone.CFrame:PointToWorldSpace(Vector3.new(x, 0, z))
+    return self:ProjectToGround(raw, zone)
 end
 
 function P:StopWalking()
     self.Navigation.Token = (self.Navigation.Token or 0) + 1
     self.Navigation.Destination = nil
     self.Navigation.LastResult = "Stopped"
-    self.Navigation.Repaths = 0
     self.Navigation.Busy = false
     self.Navigation.Waypoint = 0
 
@@ -437,6 +431,7 @@ function P:StopWalking()
             activeTween:Cancel()
         end)
     end
+    self:ReleaseTweenBody()
 
     local character = self.Player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -481,106 +476,355 @@ function P:GetRootGroundOffset(humanoid, root)
     return math.max(2.25, hip + halfRoot)
 end
 
-function P:GetTeleportRootTarget(surfacePosition, humanoid, root)
+function P:GetTweenRootTarget(surfacePosition, humanoid, root)
     if typeof(surfacePosition) ~= "Vector3" then
         return nil
     end
-    return Vector3.new(
-        surfacePosition.X,
-        surfacePosition.Y + self:GetRootGroundOffset(humanoid, root),
-        surfacePosition.Z
-    )
+    local yOffset = self:GetRootGroundOffset(humanoid, root)
+    return Vector3.new(surfacePosition.X, surfacePosition.Y + yOffset, surfacePosition.Z)
 end
 
-function P:TeleportToCFrame(targetCFrame, arrivalPredicate)
-    if typeof(targetCFrame) ~= "CFrame" then
+-- Tween physics transaction: make intermediate moves kinematic instead of letting
+-- the character collide with rocks at high speed and fling into the sky.
+-- Pathfinding, line checks and regular destination validation still prevent wall shortcuts.
+function P:ReleaseTweenBody(token)
+    local state = self.Navigation.MotionState
+    if not state or (token ~= nil and state.Token ~= token) then
+        return
+    end
+    self.Navigation.MotionState = nil
+    local root = state.Root
+    local humanoid = state.Humanoid
+    if root and root.Parent then
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.Anchored = state.WasAnchored
+        end)
+    end
+    for part, wasCollidable in pairs(state.Collisions) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = wasCollidable
+            end)
+        end
+    end
+    if humanoid and humanoid.Parent then
+        pcall(function()
+            humanoid.AutoRotate = state.AutoRotate
+            humanoid.Sit = false
+        end)
+    end
+end
+
+function P:BeginTweenBody(token, humanoid, root)
+    self:ReleaseTweenBody()
+    local character = root and root.Parent
+    if not root or not humanoid or not character then
+        return false
+    end
+    local state = {
+        Token = token,
+        Root = root,
+        Humanoid = humanoid,
+        WasAnchored = root.Anchored,
+        AutoRotate = humanoid.AutoRotate,
+        Collisions = {},
+    }
+    self.Navigation.MotionState = state
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("BasePart") then
+            state.Collisions[object] = object.CanCollide
+            object.CanCollide = false
+        end
+    end
+    humanoid.Sit = false
+    humanoid.AutoRotate = false
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    -- Remain unanchored: network-owned character movement must replicate to the
+    -- server for zone checks. Anchoring the local root can break replication.
+    return true
+end
+
+function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
+    if typeof(fromSurface) ~= "Vector3" or typeof(toSurface) ~= "Vector3" then
         return false
     end
 
+    local character, humanoid, root = self:GetCharacter()
+    if not root or not humanoid then
+        return false
+    end
+
+    local exclude = {}
+    if character then
+        table.insert(exclude, character)
+    end
+    if typeof(extraExclude) == "Instance" then
+        table.insert(exclude, extraExclude)
+    elseif type(extraExclude) == "table" then
+        for _, item in ipairs(extraExclude) do
+            if typeof(item) == "Instance" then
+                table.insert(exclude, item)
+            end
+        end
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude
+    params.IgnoreWater = false
+    pcall(function()
+        params.RespectCanCollide = true
+    end)
+
+    local fromRoot = root.Position
+    local toRoot = self:GetTweenRootTarget(toSurface, humanoid, root)
+    if not toRoot then
+        return false
+    end
+
+    -- Check both around the torso/root and lower body. This keeps the tween from
+    -- taking a visual shortcut through rocks, walls, railings, or shop props.
+    local delta = toRoot - fromRoot
+    if delta.Magnitude <= 0.2 then
+        return true
+    end
+
+    local upperHit = workspace:Raycast(fromRoot, delta, params)
+    if upperHit then
+        return false
+    end
+
+    local lowerOffset = Vector3.new(0, -math.min(1.25, self:GetRootGroundOffset(humanoid, root) * 0.45), 0)
+    local lowerHit = workspace:Raycast(fromRoot + lowerOffset, delta, params)
+    return lowerHit == nil
+end
+
+function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPredicate, blockedPredicate)
+    local function waypointResult(result, reason)
+        self:ReleaseTweenBody(token)
+        return result, reason
+    end
     local _, humanoid, root = self:GetCharacter()
     if not humanoid or not root or humanoid.Health <= 0 then
-        return false
+        return waypointResult(false, "character")
+    end
+    if typeof(surfacePosition) ~= "Vector3" then
+        return waypointResult(false, "goal")
     end
 
-    self.Navigation.Token = (self.Navigation.Token or 0) + 1
-    local token = self.Navigation.Token
-    self.Navigation.Destination = targetCFrame.Position
-    self.Navigation.LastResult = "Teleporting"
-    self.Navigation.Busy = true
-    self.Navigation.Repaths = 0
-    self.Navigation.Waypoint = 0
+    local authoritativeArrival = type(arrivalPredicate) == "function"
+    if authoritativeArrival and self:WalkArrivalSatisfied(arrivalPredicate) then
+        return waypointResult(true, "arrived")
+    end
+
+    local targetPosition = self:GetTweenRootTarget(surfacePosition, humanoid, root)
+    if not targetPosition then
+        return waypointResult(false, "goal")
+    end
+
+    local distance = (root.Position - targetPosition).Magnitude
+    if not authoritativeArrival and distance <= (acceptance or 2.5) then
+        return waypointResult(true, "arrived")
+    end
+
+    if type(blockedPredicate) == "function" then
+        local ok, blocked = pcall(blockedPredicate)
+        if ok and blocked then
+            return waypointResult(false, "blocked")
+        end
+    end
 
     humanoid.Sit = false
+    humanoid.AutoRotate = false
     pcall(function()
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = targetCFrame
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     end)
 
-    task.wait(math.clamp(tonumber(self.Settings.TeleportSettleDelay) or 0.055, 0.01, 0.35))
-
-    if not self:IsWalkTokenActive(token) then
-        return false
-    end
-
-    local arrived = true
-    if type(arrivalPredicate) == "function" then
-        arrived = self:WalkArrivalSatisfied(arrivalPredicate) == true
-    end
-
-    if self.Navigation.Token == token then
-        self.Navigation.Destination = nil
-        self.Navigation.LastResult = arrived and "Teleported" or "Teleport not confirmed"
-        self.Navigation.Busy = false
-    end
-    return arrived
-end
-
-function P:TeleportTo(objectOrCFrame, yOffset)
-    local _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root or humanoid.Health <= 0 then
-        return false
-    end
+    -- Keep the avatar upright and rotate smoothly toward the direction of travel.
+    local flatDirection = Vector3.new(
+        targetPosition.X - root.Position.X,
+        0,
+        targetPosition.Z - root.Position.Z
+    )
 
     local targetCFrame
-    if typeof(objectOrCFrame) == "CFrame" then
-        targetCFrame = objectOrCFrame
-    elseif typeof(objectOrCFrame) == "Vector3" then
-        local projected = self:ProjectToGround(objectOrCFrame)
-        local target = projected and self:GetTeleportRootTarget(projected, humanoid, root)
-        if target then
-            local look = root.CFrame.LookVector
-            local flatLook = Vector3.new(look.X, 0, look.Z)
-            if flatLook.Magnitude < 0.05 then
-                flatLook = Vector3.new(0, 0, -1)
-            else
-                flatLook = flatLook.Unit
-            end
-            targetCFrame = CFrame.lookAt(target, target + flatLook, Vector3.yAxis)
+    if flatDirection.Magnitude > 0.05 then
+        local facing = flatDirection.Unit
+        targetCFrame = CFrame.lookAt(
+            targetPosition,
+            targetPosition + Vector3.new(facing.X, 0, facing.Z),
+            Vector3.yAxis
+        )
+    else
+        local look = root.CFrame.LookVector
+        local flatLook = Vector3.new(look.X, 0, look.Z)
+        if flatLook.Magnitude < 0.05 then
+            flatLook = Vector3.new(0, 0, -1)
+        else
+            flatLook = flatLook.Unit
         end
-    elseif typeof(objectOrCFrame) == "Instance" then
-        if objectOrCFrame:IsA("BasePart") then
-            targetCFrame = objectOrCFrame.CFrame
-        elseif objectOrCFrame:IsA("Model") then
-            local ok, pivot = pcall(function()
-                return objectOrCFrame:GetPivot()
-            end)
-            if ok then
-                targetCFrame = pivot
-            end
+        targetCFrame = CFrame.lookAt(targetPosition, targetPosition + flatLook, Vector3.yAxis)
+    end
+
+    -- Constant tween speed, independent of WalkSpeed.
+    local speed = math.clamp(tonumber(self.Settings.TweenSpeed) or 32, 8, 55)
+    local duration = math.max(0.04, distance / speed)
+
+    -- Jump waypoints get a shallow two-part arc instead of snapping vertically.
+    if action == Enum.PathWaypointAction.Jump and distance > 2.5 then
+        local midpoint = (root.Position + targetPosition) * 0.5 + Vector3.new(0, 2.2, 0)
+        local firstSurface = Vector3.new(
+            midpoint.X,
+            midpoint.Y - self:GetRootGroundOffset(humanoid, root),
+            midpoint.Z
+        )
+        local ok, reason = self:TweenWaypoint(
+            firstSurface,
+            Enum.PathWaypointAction.Walk,
+            token,
+            1.0,
+            nil,
+            blockedPredicate
+        )
+        if not ok then
+            return false, reason
+        end
+        _, humanoid, root = self:GetCharacter()
+        if not humanoid or not root or humanoid.Health <= 0 then
+            return waypointResult(false, "character")
+        end
+        targetPosition = self:GetTweenRootTarget(surfacePosition, humanoid, root)
+        distance = (root.Position - targetPosition).Magnitude
+        duration = math.max(0.04, distance / speed)
+        flatDirection = Vector3.new(
+            targetPosition.X - root.Position.X,
+            0,
+            targetPosition.Z - root.Position.Z
+        )
+        if flatDirection.Magnitude > 0.05 then
+            targetCFrame = CFrame.lookAt(targetPosition, targetPosition + flatDirection.Unit, Vector3.yAxis)
+        else
+            targetCFrame = CFrame.new(targetPosition) * root.CFrame.Rotation
         end
     end
 
-    if not targetCFrame then
-        return false
+    -- Re-check collision-free line immediately before moving along each path segment.
+    -- Never silently fly through a blocking rock or wall.
+    local tweenSurface = targetPosition - Vector3.new(0, self:GetRootGroundOffset(humanoid, root), 0)
+    if not self:IsTweenLineClear(root.Position, tweenSurface) then
+        return waypointResult(false, "obstacle")
+    end
+    if not self:BeginTweenBody(token, humanoid, root) then
+        return waypointResult(false, "character")
     end
 
-    if yOffset and yOffset ~= 0 then
-        targetCFrame = targetCFrame * CFrame.new(0, yOffset, 0)
+    local tween = self.S.TweenService:Create(
+        root,
+        TweenInfo.new(
+            duration,
+            Enum.EasingStyle.Linear,
+            Enum.EasingDirection.InOut,
+            0,
+            false,
+            0
+        ),
+        {CFrame = targetCFrame}
+    )
+
+    self.Navigation.ActiveTween = tween
+    local completed = false
+    local playbackState = nil
+    local completedConnection = tween.Completed:Connect(function(state)
+        completed = true
+        playbackState = state
+    end)
+
+    tween:Play()
+    local started = os.clock()
+    local timeout = duration + math.max(1.25, duration * 0.40)
+
+    while self:IsWalkTokenActive(token) and not completed do
+        _, humanoid, root = self:GetCharacter()
+        if not humanoid or not root or humanoid.Health <= 0 then
+            pcall(function() tween:Cancel() end)
+            pcall(function() completedConnection:Disconnect() end)
+            return waypointResult(false, "character")
+        end
+
+        if authoritativeArrival and self:WalkArrivalSatisfied(arrivalPredicate) then
+            pcall(function() tween:Cancel() end)
+            pcall(function() completedConnection:Disconnect() end)
+            if self.Navigation.ActiveTween == tween then
+                self.Navigation.ActiveTween = nil
+            end
+            return waypointResult(true, "arrived")
+        end
+
+        if type(blockedPredicate) == "function" then
+            local ok, blocked = pcall(blockedPredicate)
+            if ok and blocked then
+                pcall(function() tween:Cancel() end)
+                pcall(function() completedConnection:Disconnect() end)
+                if self.Navigation.ActiveTween == tween then
+                    self.Navigation.ActiveTween = nil
+                end
+                return waypointResult(false, "blocked")
+            end
+        end
+
+        self.Navigation.LastDistance = (root.Position - targetPosition).Magnitude
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+        if os.clock() - started > timeout then
+            pcall(function() tween:Cancel() end)
+            pcall(function() completedConnection:Disconnect() end)
+            if self.Navigation.ActiveTween == tween then
+                self.Navigation.ActiveTween = nil
+            end
+            return waypointResult(false, "timeout")
+        end
+        task.wait(0.03)
     end
-    return self:TeleportToCFrame(targetCFrame)
+
+    pcall(function() completedConnection:Disconnect() end)
+    if self.Navigation.ActiveTween == tween then
+        self.Navigation.ActiveTween = nil
+    end
+
+    if not self:IsWalkTokenActive(token) then
+        pcall(function() tween:Cancel() end)
+        return waypointResult(false, "cancelled")
+    end
+
+    _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return waypointResult(false, "character")
+    end
+
+    if authoritativeArrival then
+        if self:WalkArrivalSatisfied(arrivalPredicate) then
+            return waypointResult(true, "arrived")
+        end
+    elseif (root.Position - targetPosition).Magnitude <= (acceptance or 2.5) + 0.75 then
+        return waypointResult(true, "arrived")
+    end
+
+    if playbackState == Enum.PlaybackState.Completed then
+        -- Server correction can leave the root a little short. Treat a very small
+        -- discrepancy as complete; larger corrections trigger a clean repath.
+        local residual = (root.Position - targetPosition).Magnitude
+        if not authoritativeArrival and residual <= math.max(1.5, acceptance or 2.5) then
+            return waypointResult(true, "arrived")
+        end
+    end
+
+    return waypointResult(false, "corrected")
 end
 
 function P:WalkToPosition(goalPosition, options)
@@ -594,62 +838,255 @@ function P:WalkToPosition(goalPosition, options)
         return false
     end
 
+    local acceptance = math.max(
+        0.75,
+        tonumber(options.AcceptanceRadius)
+            or tonumber(self.Settings.WalkAcceptanceRadius)
+            or 2.75
+    )
     local arrivalPredicate = options.ArrivalPredicate
-    if type(arrivalPredicate) == "function" and self:WalkArrivalSatisfied(arrivalPredicate) then
-        return true
-    end
-
+    local authoritativeArrival = type(arrivalPredicate) == "function"
     local projected = options.ProjectGround == false
         and goalPosition
         or self:ProjectToGround(goalPosition, options.Exclude)
     if not projected then
-        projected = goalPosition
-    end
-
-    local target = options.ProjectGround == false
-        and projected
-        or self:GetTeleportRootTarget(projected, humanoid, root)
-    if not target then
         return false
     end
 
-    local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
-    local facing = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
-    if facing.Magnitude < 0.05 then
-        facing = Vector3.new(0, 0, -1)
-    else
-        facing = facing.Unit
-    end
-
-    local retries = math.clamp(
-        math.floor(tonumber(options.MaxAttempts) or tonumber(self.Settings.TeleportRetries) or 3),
-        1,
-        6
-    )
-
-    for attempt = 1, retries do
-        self.Navigation.Repaths = attempt - 1
-        self.Navigation.LastResult = attempt == 1 and "Teleporting" or ("Teleport retry " .. tostring(attempt - 1))
-        local ok = self:TeleportToCFrame(
-            CFrame.lookAt(target, target + facing, Vector3.yAxis),
-            arrivalPredicate
-        )
-        if ok then
+    if authoritativeArrival then
+        if self:WalkArrivalSatisfied(arrivalPredicate) then
             return true
         end
-        task.wait(0.03)
+    else
+        local initialTarget = self:GetTweenRootTarget(projected, humanoid, root)
+        if initialTarget and (root.Position - initialTarget).Magnitude <= acceptance then
+            return true
+        end
     end
 
-    if type(arrivalPredicate) == "function" then
-        return self:WalkArrivalSatisfied(arrivalPredicate) == true
+    -- A new destination owns the movement controller and cancels any previous tween.
+    self.Navigation.Token = (self.Navigation.Token or 0) + 1
+    local token = self.Navigation.Token
+
+    local oldTween = self.Navigation.ActiveTween
+    self.Navigation.ActiveTween = nil
+    if oldTween then
+        pcall(function() oldTween:Cancel() end)
     end
 
-    _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root then
-        return false
+    self.Navigation.Destination = projected
+    self.Navigation.LastResult = "Tweening"
+    self.Navigation.Repaths = 0
+    self.Navigation.Busy = true
+    self.Navigation.Waypoint = 0
+
+    local originalAutoRotate = humanoid.AutoRotate
+
+    local function finish(result, text)
+        if self.Navigation.Token == token then
+            local active = self.Navigation.ActiveTween
+            self.Navigation.ActiveTween = nil
+            if active then
+                pcall(function() active:Cancel() end)
+            end
+
+            local _, finishHumanoid, finishRoot = self:GetCharacter()
+            if finishHumanoid then
+                pcall(function()
+                    finishHumanoid.AutoRotate = originalAutoRotate ~= false
+                    finishHumanoid.Sit = false
+                end)
+            end
+            if finishRoot then
+                pcall(function()
+                    finishRoot.AssemblyLinearVelocity = Vector3.zero
+                    finishRoot.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+
+            self.Navigation.Destination = nil
+            self.Navigation.LastResult = text or (result and "Arrived" or "Failed")
+            self.Navigation.Busy = false
+            self.Navigation.Waypoint = 0
+        end
+        return result
     end
-    local acceptance = math.max(1, tonumber(options.AcceptanceRadius) or 3)
-    return (root.Position - target).Magnitude <= acceptance + 1
+
+    local maxAttempts = math.clamp(
+        math.floor(tonumber(options.MaxAttempts) or tonumber(self.Settings.PathRetries) or 4),
+        1,
+        8
+    )
+
+    for attempt = 1, maxAttempts do
+        if not self:IsWalkTokenActive(token) then
+            return finish(false, "Cancelled")
+        end
+
+        _, humanoid, root = self:GetCharacter()
+        if not humanoid or not root or humanoid.Health <= 0 then
+            return finish(false, "Character unavailable")
+        end
+
+        if authoritativeArrival then
+            if self:WalkArrivalSatisfied(arrivalPredicate) then
+                return finish(true, "Arrived")
+            end
+        else
+            local target = self:GetTweenRootTarget(projected, humanoid, root)
+            if target and (root.Position - target).Magnitude <= acceptance then
+                return finish(true, "Arrived")
+            end
+        end
+
+        if options.ProjectGround ~= false then
+            projected = self:ProjectToGround(goalPosition, options.Exclude) or projected
+            self.Navigation.Destination = projected
+        end
+
+        self.Navigation.Repaths = attempt - 1
+        self.Navigation.LastResult = attempt == 1
+            and "Planning tween route"
+            or ("Tween repath " .. tostring(attempt - 1))
+
+        local agentRadius = math.clamp(math.max(root.Size.X, root.Size.Z) * 0.5, 1.25, 2.5)
+        local agentHeight = math.clamp(
+            root.Size.Y + (tonumber(humanoid.HipHeight) or 2) * 2,
+            4,
+            8
+        )
+        local waypointSpacing = math.clamp(
+            tonumber(self.Settings.TweenWaypointSpacing) or 9,
+            3,
+            12
+        )
+
+        local path = self.S.PathfindingService:CreatePath({
+            AgentRadius = agentRadius,
+            AgentHeight = agentHeight,
+            AgentCanJump = true,
+            AgentCanClimb = true,
+            WaypointSpacing = waypointSpacing,
+        })
+
+        local computed = pcall(function()
+            path:ComputeAsync(root.Position, projected)
+        end)
+
+        local moved = false
+        local failureReason = "path"
+        local blocked = false
+        local blockedWaypoint = math.huge
+        local currentWaypoint = 1
+        local blockedConnection
+
+        if computed and path.Status == Enum.PathStatus.Success then
+            blockedConnection = path.Blocked:Connect(function(index)
+                blockedWaypoint = math.min(blockedWaypoint, tonumber(index) or math.huge)
+                if blockedWaypoint >= currentWaypoint then
+                    blocked = true
+                end
+            end)
+
+            local waypoints = path:GetWaypoints()
+            moved = #waypoints > 0
+
+            if #waypoints <= 1 then
+                local ok, reason = self:TweenWaypoint(
+                    projected,
+                    Enum.PathWaypointAction.Walk,
+                    token,
+                    acceptance,
+                    arrivalPredicate,
+                    function() return blocked end
+                )
+                moved = ok
+                failureReason = reason
+            else
+                for index = 2, #waypoints do
+                    currentWaypoint = index
+                    self.Navigation.Waypoint = index
+
+                    if blocked and blockedWaypoint <= index then
+                        moved = false
+                        failureReason = "blocked"
+                        break
+                    end
+
+                    local waypoint = waypoints[index]
+                    local finalWaypoint = index == #waypoints
+                    self.Navigation.LastResult = string.format(
+                        "Smooth tween • point %d/%d",
+                        index - 1,
+                        #waypoints - 1
+                    )
+
+                    local ok, reason = self:TweenWaypoint(
+                        waypoint.Position,
+                        waypoint.Action,
+                        token,
+                        finalWaypoint and acceptance or 1.25,
+                        finalWaypoint and arrivalPredicate or nil,
+                        function()
+                            return blocked and blockedWaypoint <= currentWaypoint
+                        end
+                    )
+
+                    if not ok then
+                        moved = false
+                        failureReason = reason
+                        break
+                    end
+                end
+            end
+        else
+            -- Only use a direct fallback when there is a clear physical line.
+            -- This prevents a pathfinding failure from turning into wall clipping.
+            local clear = self:IsTweenLineClear(root.Position, projected, options.Exclude)
+            if clear then
+                local ok, reason = self:TweenWaypoint(
+                    projected,
+                    Enum.PathWaypointAction.Walk,
+                    token,
+                    acceptance,
+                    arrivalPredicate,
+                    nil
+                )
+                moved = ok
+                failureReason = reason
+            else
+                moved = false
+                failureReason = "no safe route"
+            end
+        end
+
+        if blockedConnection then
+            pcall(function() blockedConnection:Disconnect() end)
+        end
+
+        if moved then
+            if authoritativeArrival then
+                if self:WalkArrivalSatisfied(arrivalPredicate) then
+                    return finish(true, "Arrived")
+                end
+            else
+                _, humanoid, root = self:GetCharacter()
+                local target = root and humanoid and self:GetTweenRootTarget(projected, humanoid, root)
+                if target and (root.Position - target).Magnitude <= acceptance + 0.75 then
+                    return finish(true, "Arrived")
+                end
+            end
+        end
+
+        if not self:IsWalkTokenActive(token) then
+            return finish(false, "Cancelled")
+        end
+
+        self.Navigation.LastResult = tostring(failureReason) .. " • repathing"
+        task.wait(0.12 + math.min(0.28, attempt * 0.04))
+    end
+
+    return finish(false, "Tween route failed")
 end
 
 function P:WalkToObject(object, acceptance)
@@ -658,7 +1095,7 @@ function P:WalkToObject(object, acceptance)
         return false
     end
     return self:WalkToPosition(position, {
-        AcceptanceRadius = acceptance or 4,
+        AcceptanceRadius = acceptance or self.Settings.WalkAcceptanceRadius,
         Exclude = typeof(object) == "Instance" and object or nil,
     })
 end
@@ -668,48 +1105,80 @@ function P:WalkIntoZone(zone)
         return false
     end
     if not zone:IsA("BasePart") then
-        return self:WalkToObject(zone, 4)
+        return self:WalkToObject(zone, self.Settings.WalkAcceptanceRadius)
     end
 
-    local function inside()
-        local _, _, root = self:GetCharacter()
-        return root and self:IsPointInsidePart(zone, root.Position, 0.04)
-    end
-
-    if inside() then
+    local _, _, root = self:GetCharacter()
+    if root and self:IsPointInsidePart(zone, root.Position, 0.15) then
         return true
     end
 
+    local function inside()
+        local _, _, currentRoot = self:GetCharacter()
+        return currentRoot and self:IsPointInsidePart(zone, currentRoot.Position, 0.08)
+    end
+
     local candidates = {}
-    local primary = self:GetZoneTeleportCFrame(zone)
+    local primary = self:GetZoneWalkPoint(zone)
     if primary then
         table.insert(candidates, primary)
     end
 
-    -- Fallback points are all inside the trigger and intentionally avoid the exact centre
-    -- until the last attempt, reducing the chance of materializing inside the rock mesh.
-    local half = zone.Size * 0.5
-    local x = math.max(0, half.X * 0.55)
-    local z = math.max(0, half.Z * 0.55)
-    for _, localPoint in ipairs({
-        Vector3.new(x, 0, z),
-        Vector3.new(-x, 0, z),
-        Vector3.new(x, 0, -z),
-        Vector3.new(-x, 0, -z),
-        Vector3.zero,
-    }) do
-        local point = zone.CFrame:PointToWorldSpace(localPoint)
-        table.insert(candidates, CFrame.new(point))
+    -- Build alternate near-edge entry points. Lift zones often surround a rock,
+    -- so the geometric centre can be physically occupied even though the trigger
+    -- itself is valid. These points stay inside the zone but route around that centre.
+    local currentCharacter, currentHumanoid
+    currentCharacter, currentHumanoid, root = self:GetCharacter()
+    if root then
+        local half = zone.Size * 0.5
+        local localRoot = zone.CFrame:PointToObjectSpace(root.Position)
+        local marginX = math.min(math.max(1.0, half.X * 0.16), math.max(0.15, half.X - 0.15))
+        local marginZ = math.min(math.max(1.0, half.Z * 0.16), math.max(0.15, half.Z - 0.15))
+        local edgeX = math.max(0, half.X - marginX)
+        local edgeZ = math.max(0, half.Z - marginZ)
+        local sx = localRoot.X >= 0 and 1 or -1
+        local sz = localRoot.Z >= 0 and 1 or -1
+        local alongX = math.clamp(localRoot.X, -edgeX, edgeX)
+        local alongZ = math.clamp(localRoot.Z, -edgeZ, edgeZ)
+        local spreadX = math.min(edgeX * 0.55, 4)
+        local spreadZ = math.min(edgeZ * 0.55, 4)
+
+        local localCandidates = {}
+        local normalizedX = math.abs(localRoot.X) / math.max(half.X, 0.1)
+        local normalizedZ = math.abs(localRoot.Z) / math.max(half.Z, 0.1)
+        if normalizedX >= normalizedZ then
+            local sideX = sx * edgeX * 0.90
+            table.insert(localCandidates, Vector3.new(sideX, 0, math.clamp(alongZ + spreadZ, -edgeZ, edgeZ)))
+            table.insert(localCandidates, Vector3.new(sideX, 0, math.clamp(alongZ - spreadZ, -edgeZ, edgeZ)))
+            table.insert(localCandidates, Vector3.new(sideX * 0.78, 0, 0))
+        else
+            local sideZ = sz * edgeZ * 0.90
+            table.insert(localCandidates, Vector3.new(math.clamp(alongX + spreadX, -edgeX, edgeX), 0, sideZ))
+            table.insert(localCandidates, Vector3.new(math.clamp(alongX - spreadX, -edgeX, edgeX), 0, sideZ))
+            table.insert(localCandidates, Vector3.new(0, 0, sideZ * 0.78))
+        end
+
+        for _, localPoint in ipairs(localCandidates) do
+            local worldPoint = zone.CFrame:PointToWorldSpace(localPoint)
+            local grounded = self:ProjectToGround(worldPoint, zone)
+            if grounded then
+                table.insert(candidates, grounded)
+            end
+        end
     end
 
-    local maxTries = math.min(#candidates, math.max(2, tonumber(self.Settings.TeleportRetries) or 3) + 2)
-    for index = 1, maxTries do
+    for index, goal in ipairs(candidates) do
         if inside() then
             return true
         end
-        self.Navigation.LastResult = index == 1 and "Teleporting into zone" or ("Zone TP retry " .. tostring(index - 1))
-        self:TeleportToCFrame(candidates[index])
-        if self:WaitUntil(inside, 0.45, 0.03) then
+        self.Navigation.LastResult = index == 1 and "Entering zone" or ("Alternate zone entry " .. tostring(index - 1))
+        local reached = self:WalkToPosition(goal, {
+            AcceptanceRadius = 1.15,
+            Exclude = zone,
+            MaxAttempts = index == 1 and 4 or 2,
+            ArrivalPredicate = inside,
+        })
+        if reached and inside() then
             return true
         end
     end
@@ -721,8 +1190,8 @@ function P:WalkOutOfZone(zone, extraDistance)
     if not zone or not zone:IsA("BasePart") then
         return false
     end
-    local _, humanoid, root = self:GetCharacter()
-    if not root or not humanoid then
+    local _, _, root = self:GetCharacter()
+    if not root then
         return false
     end
     if not self:IsPointInsidePart(zone, root.Position, 0) then
@@ -738,24 +1207,17 @@ function P:WalkOutOfZone(zone, extraDistance)
     if offset.Magnitude < 0.1 then
         offset = Vector3.new(0, 0, -1)
     end
-
     local distance = math.max(zone.Size.X, zone.Size.Z) * 0.5 + (tonumber(extraDistance) or 7)
     local raw = center + offset.Unit * distance
-    local projected = self:ProjectToGround(raw, zone) or raw
-    local target = self:GetTeleportRootTarget(projected, humanoid, root)
-    if not target then
-        return false
-    end
-
-    local facing = Vector3.new(offset.Unit.X, 0, offset.Unit.Z)
-    local ok = self:TeleportToCFrame(
-        CFrame.lookAt(target, target + facing, Vector3.yAxis),
-        function()
+    local goal = self:ProjectToGround(raw, zone)
+    return self:WalkToPosition(goal, {
+        AcceptanceRadius = 2.0,
+        Exclude = zone,
+        ArrivalPredicate = function()
             local _, _, currentRoot = self:GetCharacter()
             return currentRoot and not self:IsPointInsidePart(zone, currentRoot.Position, 0)
-        end
-    )
-    return ok
+        end,
+    })
 end
 
 function P:WaitUntil(predicate, timeout, interval)
@@ -869,7 +1331,7 @@ function P:MoveToSpawn()
     if not zone then
         return false
     end
-    self:SetStatus("Teleporting to spawn to bank treasure...", "TP")
+    self:SetStatus("Moving to spawn to bank treasure...", "MOVE")
     local reached = self:WalkIntoZone(zone)
     if reached then
         self:SetStatus("Banking treasure at spawn...", "BANK")
@@ -1020,6 +1482,7 @@ function P:InstallRemoteObservers()
     end)
 
     self:Connect(self.Player.CharacterAdded, function()
+        self:StopWalking() -- interrupt tween bound to the old character
         task.delay(1, function()
             if self.Alive then
                 pcall(function()
@@ -1394,7 +1857,7 @@ function P:EnterTrainingStation(stationId)
     for index = 1, math.min(#candidates, 8) do
         local part = candidates[index].Part
         if part and part.Parent then
-            self:SetStatus("Teleporting to training station " .. tostring(stationId) .. "...", "TP")
+            self:SetStatus("Moving to training station " .. tostring(stationId) .. "...", "MOVE")
             local reached = self:WalkIntoZone(part)
             if reached then
                 local entered = self:WaitUntil(function()
@@ -1472,9 +1935,8 @@ function P:LiftStage(stageId)
 
     local weight = self:GetStageWeight(stageId)
     local estimated = weight / math.max(1, self:CurrentPower())
-    -- Teleport approach is effectively instant; the deadline now mostly covers the lift itself
-    -- plus server feedback/retrigger headroom.
-    local deadline = os.clock() + math.clamp(estimated * 2.15 + 10, 15, 100)
+    -- Moving between rocks now takes real tween travel time, not an instant teleport.
+    local deadline = os.clock() + math.clamp(estimated * 2.15 + 22, 30, 150)
     local retries = 0
 
     while self.Alive and self.Settings.Enabled and self.Settings.AutoLift and os.clock() < deadline do
@@ -1486,8 +1948,8 @@ function P:LiftStage(stageId)
         if not session or tonumber(session.StageId) ~= tonumber(stageId) then
             retries += 1
             self:SetStatus(
-                string.format("Teleporting to Stage %d • %ss lift estimate", stageId, self:Compact(math.max(0.1, weight / math.max(1, self:CurrentPower())))),
-                "TP"
+                string.format("Moving to Stage %d • %ss lift estimate", stageId, self:Compact(math.max(0.1, weight / math.max(1, self:CurrentPower())))),
+                "MOVE"
             )
 
             -- If the zone did not start after a prior entry, teleport out and back in
@@ -1522,7 +1984,7 @@ function P:LiftStage(stageId)
             )
             local _, _, root = self:GetCharacter()
             if root and zone:IsA("BasePart") and not self:IsPointInsidePart(zone, root.Position, 0) then
-                self:SetStatus("Teleporting back into Stage " .. tostring(stageId) .. " LiftZone...", "TP")
+                self:SetStatus("Moving back into Stage " .. tostring(stageId) .. " LiftZone...", "MOVE")
                 self:WalkIntoZone(zone)
             end
             task.wait(0.12)
@@ -1580,6 +2042,27 @@ function P:RarityRank(item)
     if type(rarity) ~= "string" then
         rarity = item and item.Rarity
     end
+    -- Remote payloads may omit ItemType while retaining the treasure Key. The
+    -- static treasure catalog resolves the tier (Divine beats Celestial), whereas
+    -- a nil ItemType made ItemUtils.GetRarity incorrectly return nil or 0.
+    if type(rarity) ~= "string" and item and item.Key then
+        local config = self.M.Config.Treasures
+        local info = type(config) == "table" and config.Items or nil
+        local key = type(config) == "table" and type(config.KeyAliases) == "table"
+            and (config.KeyAliases[item.Key] or item.Key) or item.Key
+        local definition = type(info) == "table" and info[key] or nil
+        if type(definition) == "table" then
+            rarity = definition.Rarity
+        end
+    end
+    if item and item.ItemType == "Treasure" and item.Key then
+        local treasure = self.M.Config.Treasures or {}
+        local key = (treasure.KeyAliases or {})[item.Key] or item.Key
+        local configured = (treasure.Items or {})[key]
+        if type(configured) == "table" and type(configured.Rarity) == "string" then
+            rarity = configured.Rarity
+        end
+    end
     -- Use the game's own Rarities[id] table. UPD added Ethereal (10),
     -- moving Exclusive to 11; the previous hard-coded list omitted Ethereal.
     local entry = type(rarity) == "string" and (self.M.Config.Rarities or {})[rarity]
@@ -1593,6 +2076,33 @@ function P:RarityRank(item)
         rank = fallback[rarity] or 0
     end
     return rank, rarity or "Unknown"
+end
+
+function P:MinimumRarityRank()
+    local selected = tostring(self.Settings.MinPickupRarity or "Any")
+    if selected == "Any" then
+        return 0
+    end
+    local definitions = self.M.Config.Rarities or {}
+    local entry = definitions[selected]
+    local fallback = {
+        Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5,
+        Mythic = 6, Secret = 7, Celestial = 8, Divine = 9, Ethereal = 10,
+        Exclusive = 11,
+    }
+    return (type(entry) == "table" and tonumber(entry.id)) or fallback[selected] or 0
+end
+
+function P:PickupAllowed(candidate)
+    if not candidate then
+        return false
+    end
+    -- Tutorial requires its first pickup; don't soft-lock a fresh player who
+    -- saved a Divine+ filter from another session.
+    if self:Data().TutorialCompleted ~= true then
+        return true
+    end
+    return candidate.RarityRank >= self:MinimumRarityRank()
 end
 
 function P:CandidateData(stageId, slot, item, special)
@@ -1669,6 +2179,27 @@ function P:GetRewardCandidates()
         end
     end
 
+    -- Merge client-visible, locally spawned treasure when its pickup prompt is
+    -- enabled. These can be newer than a delayed RockLiftingFeedback snapshot.
+    local stagesFolder = self:Map() and self:Map():FindFirstChild("Stages")
+    if stagesFolder then
+        for _, stage in ipairs(stagesFolder:GetChildren()) do
+            local stageId = tonumber(stage:GetAttribute("StageId")) or tonumber(stage.Name:match("^Stage(%d+)$"))
+            if stageId and not staged[stageId] then
+                for _, model in ipairs(stage:GetChildren()) do
+                    if model:IsA("Model") and type(model:GetAttribute("UUID")) == "string"
+                        and type(model:GetAttribute("SpawnSlot")) == "string" then
+                        local prompt = model:FindFirstChild("PickupTreasure", true)
+                        if prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled then
+                            staged[stageId] = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
     for stageId in pairs(staged) do
         local reward = self.Run.Rewards[stageId]
         local items = reward and reward.Items or {}
@@ -1702,7 +2233,10 @@ function P:GetRewardCandidates()
 
             if type(item) == "table" and type(item.UUID) == "string"
                 and not self.Run.PickedUUIDs[item.UUID] then
-                table.insert(candidates, self:CandidateData(stageId, slot, item, isSpecial))
+                local candidate = self:CandidateData(stageId, slot, item, isSpecial)
+                if self:PickupAllowed(candidate) then
+                    table.insert(candidates, candidate)
+                end
             end
         end
     end
@@ -1861,11 +2395,11 @@ function P:BankRun()
         return backpackEmpty and (banked or reset)
     end, 4.5, 0.05)
     if not ok then
-        -- Retrigger the bank zone by teleporting out and back in.
+        -- Retrigger the bank zone by moving out and back in.
         local map = self:Map()
         local zone = map and map:FindFirstChild("SpawnZone")
         if zone and zone:IsA("BasePart") then
-            self:SetStatus("Bank did not trigger; teleporting out and back into SpawnZone...", "RECOVER")
+            self:SetStatus("Bank did not trigger; moving out and back into SpawnZone...", "RECOVER")
             self:WalkOutOfZone(zone, 8)
             task.wait(0.1)
             self:WalkIntoZone(zone)
@@ -1875,6 +2409,8 @@ function P:BankRun()
         end, 4, 0.05)
     end
     return self:BackpackCount() == 0
+        and (self.Run.LastBank > previousBank or self.Run.LastReset > previousReset
+            or self:HighestCleared() == 0)
 end
 
 function P:SellableInventory()
@@ -1903,7 +2439,7 @@ function P:GoToShopZone(shopName)
     local shop = shops and shops:FindFirstChild(shopName)
     local zone = shop and (shop:FindFirstChild("Zone") or shop:FindFirstChild("Zone", true))
     if zone and zone:IsA("BasePart") then
-        self:SetStatus("Teleporting to " .. tostring(shopName) .. " shop...", "TP")
+        self:SetStatus("Moving to " .. tostring(shopName) .. " shop...", "MOVE")
         local reached = self:WalkIntoZone(zone)
         if reached then
             task.wait(0.2)
@@ -1920,7 +2456,7 @@ function P:PlaceBestLuck()
     end
     local plotPart = self:GetPlotUpgradeInfo()
     if plotPart then
-        self:SetStatus("Teleporting to plot for Best Luck placement...", "TP")
+        self:SetStatus("Moving to plot for Best Luck placement...", "MOVE")
         self:WalkToObject(plotPart, 6)
     end
     pcall(function()
@@ -2334,7 +2870,7 @@ function P:TryUpgradePlot(forceRequired)
         end
     end
     if object then
-        self:SetStatus("Teleporting to plot upgrade...", "TP")
+        self:SetStatus("Moving to plot upgrade...", "MOVE")
         if not self:WalkToObject(object, 6) then
             return false
         end
@@ -2388,7 +2924,7 @@ function P:ManageEconomyUpgrades()
     local nextArmId = self:GetNextArmInfo()
     self:TryUpgradePlot(nextArmId == nil)
 
-    -- Teleport travel makes MoveSpeed non-essential. It is available only when the
+    -- Tween travel makes MoveSpeed non-essential. It is available only when the
     -- user explicitly enables optional movement upgrades.
     if self.Settings.BuyOptionalMoveSpeed then
         self:TryPurchaseUpgrade("MoveSpeed", self.Settings.MoveSpeedBudgetFraction, false)
@@ -2606,6 +3142,12 @@ function P:RunProgressionCycle()
         self:SetStatus("Selecting the best treasure from cleared stages...", "COLLECT")
         local collected = self:CollectBestRewards(self:BackpackCapacity())
 
+        if collected == 0 and self:BackpackCount() == 0
+            and #self:GetRewardCandidates() == 0 and self:MinimumRarityRank() > 0 then
+            self:SetStatus("No eligible " .. tostring(self.Settings.MinPickupRarity)
+                .. "+ treasure this run - rerolling", "FILTER")
+        end
+
         if self.Settings.AutoBank then
             -- Only bank early if no better treasure remains or the backpack is full;
             -- otherwise a transient pickup failure would irreversibly discard the rarest item.
@@ -2787,10 +3329,10 @@ function P:CreateUI()
         local replacements = {
             {"Synchronizing current rock run%.%.%.", "Preparing..."},
             {"Optimizing required progression, inventory, arms and upgrades%.%.%.", "Checking upgrades..."},
-            {"Teleporting to ", "Moving to "},
+            {"Moving to ", "Moving to "},
             {"teleporting to ", "moving to "},
             {"Bank did not trigger; moving out and back into SpawnZone%.%.%.", "Retrying bank..."},
-            {"Bank did not trigger; teleporting out and back into SpawnZone%.%.%.", "Retrying bank..."},
+            {"Bank did not trigger; moving out and back into SpawnZone%.%.%.", "Retrying bank..."},
             {"Could not bank yet; retaining unbanked treasure and retrying%.%.%.", "Retrying bank..."},
             {"Pickup did not confirm; retaining rewards and retrying instead of resetting", "Retrying treasure pickup..."},
             {"Main loop crashed %- see console", "Recovering..."},
@@ -2870,6 +3412,27 @@ function P:CreateUI()
     bindToggle(farm, "Smart Stage Selection", "AdaptiveROI")
     bindToggle(farm, "Push New Rock Stages", "PushNewStages")
     bindToggle(farm, "Prioritize New Treasures", "IndexPriority")
+    farm:CreateSection("Treasure Rarity Filter")
+    farm:CreateDropdown({
+        Name = "Minimum Rarity to Collect",
+        Options = {
+            "Any", "Common", "Uncommon", "Rare", "Epic", "Legendary",
+            "Mythic", "Secret", "Celestial", "Divine", "Ethereal", "Exclusive",
+        },
+        CurrentOption = tostring(self.Settings.MinPickupRarity or "Any"),
+        Flag = "LiftRock.MinPickupRarity",
+        Callback = function(value)
+            if type(value) == "string" then
+                self.Settings.MinPickupRarity = value
+            end
+        end,
+    })
+    farm:CreateParagraph({
+        Title = "Priority",
+        Content = "Always highest rarity first. Divine outranks Celestial. "
+            .. "Setting Divine skips Celestial and below; skipped treasure is rerolled.",
+        Height = 54,
+    })
     bindSlider(farm, "Training Speed", "TapRate", {5, 29}, 1, "/s")
 
     local upgrades = window:CreateTab("Upgrades")
@@ -2888,6 +3451,8 @@ function P:CreateUI()
     local settingsTab = window:CreateTab("Settings")
     settingsTab:CreateSection("General")
     bindToggle(settingsTab, "Anti AFK", "AntiAFK")
+    settingsTab:CreateSection("Movement")
+    bindSlider(settingsTab, "Safe Tween Speed", "TweenSpeed", {12, 55}, 1, " studs/s")
     settingsTab:CreateButton({
         Name = "Unload Script",
         Callback = function()
@@ -2960,6 +3525,7 @@ function P:MainLoop()
             end)
             if not ok then
                 self.LastError = tostring(err)
+                self:StopWalking() -- restores movement collision state after a failed tween
                 warn("[PuckAFK Lift Rock] cycle error: " .. tostring(err))
                 pcall(function()
                     self.R.RockLiftingInput:FireServer("Sync")
