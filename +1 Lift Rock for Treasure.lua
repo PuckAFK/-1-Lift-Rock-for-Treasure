@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.6 - Shop-Safe Sky Tween + Popup Recovery
+    Smart AutoFarm v1.7.7 - Low-Roof Shop Hop + Instant Descent
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.6",
+    Version = "1.7.7",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -163,7 +163,7 @@ P.Settings = {
     TweenSpeed = 600, -- New Farming-tab setting; legacy saved Settings speed is ignored. 20-750 studs/s.
     TweenWaypointSpacing = 8,
     AvoidUnwantedShops = true, -- Always enabled: do not cut across tagged shop/menu zones.
-    SkyShopClearance = 30, -- Vertical clearance above every mapped menu trigger.
+    SkyShopClearance = 1.5, -- Minimal clearance above crossed roofs; sky used ONLY over shops.
     AutoDismissShopMenus = true, -- Restore controls when a shop popup blocks AFK farming.
 
     -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
@@ -666,18 +666,147 @@ function P:DestinationHitsMenuZone(position, allowedZone)
     return false
 end
 
-function P:GetShopSafeAltitude(currentRoot, goalRoot)
-    local clearance = math.clamp(tonumber(self.Settings.SkyShopClearance) or 30, 18, 75)
-    local safeY = math.max(currentRoot.Y, goalRoot.Y) + clearance
+-- Return the shop *building* containing a menu trigger, not other tagged UI
+-- zones elsewhere in the map. Only shop buildings can cause a sky-hop.
+function P:GetShopBuildingForTrigger(zone)
+    local map = self:Map()
+    local shops = map and map:FindFirstChild("Shops")
+    if not shops or not zone then return nil end
+    local ancestor = zone
+    while ancestor and ancestor.Parent ~= shops do
+        ancestor = ancestor.Parent
+    end
+    if ancestor and ancestor.Parent == shops then return ancestor end
+    return nil
+end
+
+-- 2-D entry/exit fractions against a rotated shop zone's horizontal bounds.
+-- The route's Y is deliberately ignored: we need the shop footprint, not the
+-- height of a decorative part or an unrelated ZoneOpener.
+function P:ShopFootprintWindow(fromRoot, toRoot, zone)
+    if not zone or typeof(fromRoot) ~= "Vector3" or typeof(toRoot) ~= "Vector3" then
+        return nil
+    end
+    -- Prefer the whole shop building footprint, not just its smaller invisible
+    -- trigger: this ensures the ascent and landing are OUTSIDE the actual roof.
+    local cf, half = zone.CFrame, zone.Size * 0.5
+    local building = self:GetShopBuildingForTrigger(zone)
+    if building and building:IsA("Model") then
+        local ok, boundingCF, boundingSize = pcall(function()
+            return building:GetBoundingBox()
+        end)
+        if ok and boundingCF and boundingSize then
+            cf, half = boundingCF, boundingSize * 0.5
+        end
+    end
+    local hx = math.abs(cf.RightVector.X) * half.X
+        + math.abs(cf.UpVector.X) * half.Y
+        + math.abs(cf.LookVector.X) * half.Z + 7
+    local hz = math.abs(cf.RightVector.Z) * half.X
+        + math.abs(cf.UpVector.Z) * half.Y
+        + math.abs(cf.LookVector.Z) * half.Z + 7
+    local dx, dz = toRoot.X - fromRoot.X, toRoot.Z - fromRoot.Z
+    local first, last = 0, 1
+    for _, axis in ipairs({
+        {fromRoot.X - cf.Position.X, dx, hx},
+        {fromRoot.Z - cf.Position.Z, dz, hz},
+    }) do
+        local origin, direction, radius = axis[1], axis[2], axis[3]
+        if math.abs(direction) < 0.0001 then
+            if math.abs(origin) > radius then return nil end
+        else
+            local a = (-radius - origin) / direction
+            local b = ( radius - origin) / direction
+            if a > b then a, b = b, a end
+            first, last = math.max(first, a), math.min(last, b)
+            if first > last then return nil end
+        end
+    end
+    return first, last
+end
+
+-- Cross only the nearest connected cluster of shop footprints. Widely spaced
+-- shops get independent low hops with grounded travel between them.
+function P:GetNextShopHopWindow(fromRoot, toRoot, allowedZone)
+    local distance = Vector3.new(toRoot.X - fromRoot.X, 0,
+        toRoot.Z - fromRoot.Z).Magnitude
+    if distance < 2 then return nil end
+    local intersections = {}
     for _, entry in ipairs(self:GetMenuTriggerZones()) do
-        local part = entry.Part
-        local cf, half = part.CFrame, part.Size * 0.5
-        local upBound = math.abs(cf.RightVector.Y) * half.X
+        if entry.Part ~= allowedZone and self:GetShopBuildingForTrigger(entry.Part) then
+            local first, last = self:ShopFootprintWindow(fromRoot, toRoot, entry.Part)
+            if first and last and last > 0 and first < 1 then
+                table.insert(intersections, {
+                    First = math.max(0, first), Last = math.min(1, last),
+                    Entry = entry,
+                })
+            end
+        end
+    end
+    table.sort(intersections, function(a,b) return a.First < b.First end)
+    if #intersections == 0 then return nil end
+    local before, after = intersections[1].First, intersections[1].Last
+    local selected = {intersections[1].Entry}
+    for index = 2, #intersections do
+        local nextZone = intersections[index]
+        if nextZone.First > after + 18 / distance then break end
+        after = math.max(after, nextZone.Last)
+        table.insert(selected, nextZone.Entry)
+    end
+    -- 12 studs outside the padded zone edges for takeoff and landing.
+    -- Never extend past the requested destination.
+    return {
+        Before = math.max(0, before - 12 / distance),
+        After = math.min(1, after + 12 / distance),
+        Entries = selected,
+    }
+end
+
+function P:GetShopSafeAltitude(currentRoot, goalRoot, entries, humanoid, root)
+    -- Height is measured from the actual shop roofs and the crossed trigger
+    -- upper bounds. Decorative towers or menu zones elsewhere do not count.
+    local offset = self:GetRootGroundOffset(humanoid, root)
+    local clearance = 1.5
+    local roofTop = -math.huge
+    local visited = {}
+    for _, entry in ipairs(entries or {}) do
+        local zone = entry.Part
+        local building = self:GetShopBuildingForTrigger(zone)
+        if building and not visited[building] then
+            visited[building] = true
+            local explicitRoofTop, broadPartTop = -math.huge, -math.huge
+            for _, part in ipairs(building:GetDescendants()) do
+                if part:IsA("BasePart") and part ~= zone and part.CanCollide then
+                    local half = part.Size * 0.5
+                    local cf = part.CFrame
+                    local upper = part.Position.Y
+                        + math.abs(cf.RightVector.Y) * half.X
+                        + math.abs(cf.UpVector.Y) * half.Y
+                        + math.abs(cf.LookVector.Y) * half.Z
+                    local name = string.lower(part.Name)
+                    if name:find("roof", 1, true) or name:find("ceiling", 1, true) then
+                        explicitRoofTop = math.max(explicitRoofTop, upper)
+                    elseif part.Size.X * part.Size.Z >= 15 then
+                        -- Ignore tall decorative signs and skinny antennas.
+                        broadPartTop = math.max(broadPartTop, upper)
+                    end
+                end
+            end
+            local actualRoof = explicitRoofTop > -math.huge and explicitRoofTop
+                or broadPartTop
+            roofTop = math.max(roofTop, actualRoof)
+        end
+        -- Keep the avatar above the ZoneOpener itself; if an invisible zone
+        -- extends above the roof, clearing the actual trigger is mandatory.
+        local half, cf = zone.Size * 0.5, zone.CFrame
+        local zoneTop = zone.Position.Y
+            + math.abs(cf.RightVector.Y) * half.X
             + math.abs(cf.UpVector.Y) * half.Y
             + math.abs(cf.LookVector.Y) * half.Z
-        safeY = math.max(safeY, part.Position.Y + upBound + clearance)
+        roofTop = math.max(roofTop, zoneTop)
     end
-    return safeY
+    if roofTop == -math.huge then return nil end
+    return roofTop + offset + clearance
 end
 
 function P:DismissBlockingShopMenus()
@@ -787,69 +916,85 @@ function P:ExitOccupiedMenuZone(token)
     return false
 end
 
--- Escape ground shop/menu triggers using three smooth, checked tween legs:
--- straight up to a clear corridor, across above every zone, then straight
--- down outside forbidden zones (or into the one intentionally selected shop).
+-- Only hop over shop buildings actually crossed by this route. Travel to the
+-- near side at ground level, climb to just over the crossed shop rooftops,
+-- cross, and LAND immediately on the far side. The route then resumes normal
+-- ground tweening to its destination; it never cruises across the whole map.
 function P:FlyOverMenuZones(groundDestination, token, allowedZone, acceptance, predicate)
     local _, humanoid, root = self:GetCharacter()
-    if not root or not humanoid then return false, "character" end
+    if not root or not humanoid or humanoid.Health <= 0 then return false, "character" end
     local targetRoot = self:GetTweenRootTarget(groundDestination, humanoid, root)
     if not targetRoot then return false, "goal" end
     if self:DestinationHitsMenuZone(targetRoot, allowedZone) then
         return false, "destination inside shop trigger"
     end
-    local altitude = self:GetShopSafeAltitude(root.Position, targetRoot)
-    local offset = self:GetRootGroundOffset(humanoid, root)
-    local ascentSurface = Vector3.new(root.Position.X, altitude - offset, root.Position.Z)
-    local cruiseSurface = Vector3.new(targetRoot.X, altitude - offset, targetRoot.Z)
-    self.Navigation.SkyTravel = true
+    local window = self:GetNextShopHopWindow(root.Position, targetRoot, allowedZone)
+    if not window then return false, "no intersecting shop building" end
+    local travel = Vector3.new(targetRoot.X - root.Position.X, 0,
+        targetRoot.Z - root.Position.Z)
+    local function groundAt(t)
+        local sample = root.Position + travel * t
+        return self:ProjectToGround(sample)
+    end
+    local beforeGround, afterGround = groundAt(window.Before), groundAt(window.After)
+    if not beforeGround or not afterGround then return false, "no safe ground" end
+    local beforeRoot = self:GetTweenRootTarget(beforeGround, humanoid, root)
+    local afterRoot = self:GetTweenRootTarget(afterGround, humanoid, root)
+    if self:DestinationHitsMenuZone(beforeRoot, allowedZone)
+        or self:DestinationHitsMenuZone(afterRoot, allowedZone) then
+        return false, "takeoff/landing near a shop trigger"
+    end
 
-    local legs = {
-        {Point = ascentSurface, Label = "Rising above shop zones", Escape = true},
-        {Point = cruiseSurface, Label = "Flying over shop zones"},
-        {Point = groundDestination, Label = "Descending to target", Last = true},
-    }
-    for _, leg in ipairs(legs) do
-        if not self:IsWalkTokenActive(token) then
-            self.Navigation.SkyAscent = false
-            return false, "cancelled"
-        end
-        self.Navigation.SkyAscent = leg.Escape == true
-        self.Navigation.LastResult = leg.Label
-        local ok, why = self:TweenWaypoint(
-            leg.Point, Enum.PathWaypointAction.Walk, token,
-            leg.Last and acceptance or 2.5,
-            leg.Last and predicate or nil,
-            nil,
-            leg.Last and 155 or nil
-        )
-        if not ok and leg.Escape and tostring(why) == "obstacle" then
-            self.Navigation.LastResult = "Escaping roofed shop safely"
-            if self:ExitOccupiedMenuZone(token) then
-                local _, newHumanoid, newRoot = self:GetCharacter()
-                if newHumanoid and newRoot then
-                    local revisedAltitude = self:GetShopSafeAltitude(newRoot.Position, targetRoot)
-                    local rootOffset = self:GetRootGroundOffset(newHumanoid, newRoot)
-                    local revisedSurface = Vector3.new(
-                        newRoot.Position.X, revisedAltitude - rootOffset, newRoot.Position.Z
-                    )
-                    ok, why = self:TweenWaypoint(revisedSurface,
-                        Enum.PathWaypointAction.Walk, token, 2.5, nil, nil)
-                    if ok then
-                        -- Follow the newly established altitude on the cruise leg.
-                        legs[2].Point = Vector3.new(targetRoot.X,
-                            revisedAltitude - rootOffset, targetRoot.Z)
-                    end
-                end
+    self.Navigation.SkyTravel = true
+    self.Navigation.SkyAscent = false
+    -- Approach is entirely on the ground. Direct unsafe shortcuts are rejected.
+    if (beforeRoot - root.Position).Magnitude > 2.5 then
+        self.Navigation.LastResult = "Approaching shops on ground"
+        local ok, why = self:TweenWaypoint(beforeGround,
+            Enum.PathWaypointAction.Walk, token, 2.5)
+        if not ok then return false, "approach: " .. tostring(why) end
+    end
+    _, humanoid, root = self:GetCharacter()
+    if not root or not humanoid or humanoid.Health <= 0 then return false, "character" end
+    local topY = self:GetShopSafeAltitude(root.Position, afterRoot,
+        window.Entries, humanoid, root)
+    if not topY then return false, "shop roof missing" end
+    local offset = self:GetRootGroundOffset(humanoid, root)
+    local ascentGround = Vector3.new(root.Position.X, topY - offset, root.Position.Z)
+    local crossingGround = Vector3.new(afterRoot.X, topY - offset, afterRoot.Z)
+
+    self.Navigation.SkyAscent = true
+    self.Navigation.LastResult = "Low ascent to shop roof"
+    local ok, why = self:TweenWaypoint(ascentGround,
+        Enum.PathWaypointAction.Walk, token, 1.25)
+    if not ok and tostring(why) == "obstacle" then
+        -- A character left *inside* a shop may have a roof over their head.
+        -- Escape sideways rather than raising the altitude of every route.
+        if self:ExitOccupiedMenuZone(token) then
+            local _, h, r = self:GetCharacter()
+            if r and h then
+                ascentGround = Vector3.new(r.Position.X, topY - self:GetRootGroundOffset(h,r),r.Position.Z)
+                ok, why = self:TweenWaypoint(ascentGround,
+                    Enum.PathWaypointAction.Walk, token, 1.25)
             end
-        end
-        if not ok then
-            self.Navigation.SkyAscent = false
-            return false, tostring(leg.Label) .. ": " .. tostring(why)
         end
     end
     self.Navigation.SkyAscent = false
-    return true, "arrived"
+    if not ok then return false, "low ascent: " .. tostring(why) end
+
+    self.Navigation.LastResult = "Crossing shop rooftops"
+    ok, why = self:TweenWaypoint(crossingGround,
+        Enum.PathWaypointAction.Walk, token, 1.25)
+    if not ok then return false, "roof crossing: " .. tostring(why) end
+
+    -- No descent speed cap: the previous 155-stud cap and retry loop could
+    -- leave the character appearing suspended above the shop for seconds.
+    self.Navigation.LastResult = "Landing immediately after shops"
+    ok, why = self:TweenWaypoint(afterGround,
+        Enum.PathWaypointAction.Walk, token, 2.0)
+    if not ok then return false, "landing: " .. tostring(why) end
+    self.Navigation.SkyTravel = false
+    return true, "shop cluster cleared"
 end
 
 function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
@@ -1271,7 +1416,11 @@ function P:WalkToPosition(goalPosition, options)
         8
     )
 
-    for attempt = 1, maxAttempts do
+    -- Shop hops are transit steps, not failed navigation attempts. Allow up
+    -- to four separate shop clusters without consuming the ground repath budget.
+    local skyHops = 0
+    for attempt = 1, maxAttempts + 4 do
+        if attempt > maxAttempts + skyHops then break end
         if not self:IsWalkTokenActive(token) then
             return finish(false, "Cancelled")
         end
@@ -1303,25 +1452,38 @@ function P:WalkToPosition(goalPosition, options)
         local crossesShop = projectedRoot and self:RouteCrossesMenuZone(
             root.Position, projectedRoot, options.AllowedShopZone, 8
         )
-        local menuTriggers = self:GetMenuTriggerZones()
-        -- Long routes fly above shops by default. Ground walking is retained
-        -- for short local adjustments with no shop obstruction.
-        if self.Settings.AvoidUnwantedShops and #menuTriggers > 0
-            and (crossesShop or distance > 18) then
+        -- No shop in the way => never gain altitude. Unlike v1.7.6, long
+        -- distances alone do not trigger sky travel.
+        local shopWindow = crossesShop and projectedRoot and self:GetNextShopHopWindow(
+            root.Position, projectedRoot, options.AllowedShopZone
+        )
+        if self.Settings.AvoidUnwantedShops and shopWindow then
             local moved, reason = self:FlyOverMenuZones(
                 projected, token, options.AllowedShopZone, acceptance, arrivalPredicate
             )
             if moved then
-                return finish(true, "Arrived via protected sky route")
+                skyHops += 1
+                if skyHops > 4 then
+                    return finish(false, "Too many shop crossings; stopping safely")
+                end
+                -- A sky hop lands immediately past the shop, NOT at the final
+                -- destination. Continue normal routing from the ground.
+                self.Navigation.LastResult = "Shop cleared; continuing on ground"
+                if authoritativeArrival and self:WalkArrivalSatisfied(arrivalPredicate) then
+                    return finish(true, "Arrived")
+                end
+                local _, h, r = self:GetCharacter()
+                local finalRoot = h and r and self:GetTweenRootTarget(projected, h, r)
+                if finalRoot and (r.Position - finalRoot).Magnitude <= acceptance then
+                    return finish(true, "Arrived")
+                end
+                -- Re-evaluate from the grounded position without hovering or
+                -- repeating a sky trip over the rest of the map.
+                continue
             end
-            if not self:IsWalkTokenActive(token) then
-                return finish(false, "Cancelled")
-            end
-            self.Navigation.LastResult = "Sky route retry: " .. tostring(reason)
-            task.wait(0.16 + math.min(0.3, attempt * 0.04))
-            -- Never fall back to a shop-crossing ground route when sky travel
-            -- fails; this avoids the original unexpected shop menu popup.
-            continue
+            -- Fail promptly and restore body physics. Repeated airborne route
+            -- retries were the source of multi-second suspended motion.
+            return finish(false, "Safe shop hop failed: " .. tostring(reason))
         end
 
         self.Navigation.LastResult = attempt == 1
