@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.1 - Safe Tween + Rarity Filter
+    Smart AutoFarm v1.7.2 - Fast Smooth Tween + Rarity Filter
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -33,6 +33,7 @@
       * Authoritative special-spawn snapshot rebuild with revision-safe delta handling
       * Requirement-aware progression purchases that bypass optional budgets when actually needed
       * Automatic cash/power milestone planning for backpack, arms, rebirths and training unlocks
+      * Fast configurable smooth tween (20-360 studs/s; 180 default), path string-pulling and continuous collision safety
       * PuckUI v3 shared interface loaded from the canonical PuckAFK/Puck-Loader source
 
     The server is still authoritative: remotes are called with the same argument shapes used by the game,
@@ -75,7 +76,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.1",
+    Version = "1.7.2",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -148,12 +149,12 @@ P.Settings = {
     PushNewStages = true,
     AntiAFK = true,
 
-    -- Server-verified pathfinding + smooth tween movement; no instant teleport.
-    -- The HRP is temporarily collision-isolated during each safe segment; all collision states
-    -- are restored on arrival, pause, respawn, error, and unload to prevent flinging.
+    -- Fast, continuously collision-isolated pathfinding + smooth tween movement.
+    -- The HRP remains non-collidable only while traversing a route; collision state
+    -- is restored on route completion, pause, respawn, error, and unload.
     WalkAcceptanceRadius = 2.75,
     PathRetries = 4,
-    TweenSpeed = 32,
+    TweenSpeed = 180, -- Fast default; adjustable in Settings from 20 to 360 studs/s.
     TweenWaypointSpacing = 8,
 
     -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
@@ -518,6 +519,13 @@ function P:ReleaseTweenBody(token)
 end
 
 function P:BeginTweenBody(token, humanoid, root)
+    -- Keep the collision-isolated controller for the entire route: toggling
+    -- CanCollide at every small waypoint causes micro-pauses and fling impulses.
+    local existing = self.Navigation.MotionState
+    if existing and existing.Token == token and existing.Root == root
+        and existing.Humanoid == humanoid and root.Parent then
+        return true
+    end
     self:ReleaseTweenBody()
     local character = root and root.Parent
     if not root or not humanoid or not character then
@@ -603,8 +611,9 @@ function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
 end
 
 function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPredicate, blockedPredicate)
+    -- Movement/collision isolation belongs to the *whole route*, not to each
+    -- waypoint. The route finisher, StopWalking, respawn, and Unload release it.
     local function waypointResult(result, reason)
-        self:ReleaseTweenBody(token)
         return result, reason
     end
     local _, humanoid, root = self:GetCharacter()
@@ -670,8 +679,9 @@ function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPred
         targetCFrame = CFrame.lookAt(targetPosition, targetPosition + flatLook, Vector3.yAxis)
     end
 
-    -- Constant tween speed, independent of WalkSpeed.
-    local speed = math.clamp(tonumber(self.Settings.TweenSpeed) or 32, 8, 55)
+    -- Keep velocity continuous across adjacent waypoints: one constant rate,
+    -- smooth CFrame rotation, no easing slowdown at every turn.
+    local speed = math.clamp(tonumber(self.Settings.TweenSpeed) or 180, 20, 360)
     local duration = math.max(0.04, distance / speed)
 
     -- Jump waypoints get a shallow two-part arc instead of snapping vertically.
@@ -789,7 +799,7 @@ function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPred
             end
             return waypointResult(false, "timeout")
         end
-        task.wait(0.03)
+        task.wait(0.016) -- fine-grained arrival/blocked checks at high speed
     end
 
     pcall(function() completedConnection:Disconnect() end)
@@ -873,6 +883,7 @@ function P:WalkToPosition(goalPosition, options)
     if oldTween then
         pcall(function() oldTween:Cancel() end)
     end
+    self:ReleaseTweenBody() -- never carry an old route's collision state forward
 
     self.Navigation.Destination = projected
     self.Navigation.LastResult = "Tweening"
@@ -889,6 +900,7 @@ function P:WalkToPosition(goalPosition, options)
             if active then
                 pcall(function() active:Cancel() end)
             end
+            self:ReleaseTweenBody(token) -- restore collisions only once, at route end
 
             local _, finishHumanoid, finishRoot = self:GetCharacter()
             if finishHumanoid then
@@ -1003,21 +1015,52 @@ function P:WalkToPosition(goalPosition, options)
                 moved = ok
                 failureReason = reason
             else
-                for index = 2, #waypoints do
-                    currentWaypoint = index
-                    self.Navigation.Waypoint = index
+                -- String-pull the computed path into the longest physically
+                -- clear segments. This removes dozens of tiny start/stop tweens
+                -- without cutting through walls or skipping jump waypoints.
+                local index = 2
+                while index <= #waypoints do
+                    local destinationIndex = index
+                    local nextAction = waypoints[index].Action
+                    if nextAction ~= Enum.PathWaypointAction.Jump then
+                        local upper = math.min(#waypoints, index + 14)
+                        local jumpBetween = false
+                        for candidate = index + 1, upper do
+                            if waypoints[candidate].Action == Enum.PathWaypointAction.Jump then
+                                jumpBetween = true
+                            end
+                            if jumpBetween then
+                                break
+                            end
+                            local _, _, currentRoot = self:GetCharacter()
+                            if currentRoot and self:IsTweenLineClear(
+                                currentRoot.Position,
+                                waypoints[candidate].Position,
+                                options.Exclude
+                            ) then
+                                destinationIndex = candidate
+                            else
+                                -- A clear segment to a later waypoint can exist even
+                                -- if an intermediate segment is obstructed, but don't
+                                -- gamble at high speeds: take the known safe prefix.
+                                break
+                            end
+                        end
+                    end
 
-                    if blocked and blockedWaypoint <= index then
+                    currentWaypoint = destinationIndex
+                    self.Navigation.Waypoint = destinationIndex
+                    if blocked and blockedWaypoint <= destinationIndex then
                         moved = false
                         failureReason = "blocked"
                         break
                     end
 
-                    local waypoint = waypoints[index]
-                    local finalWaypoint = index == #waypoints
+                    local waypoint = waypoints[destinationIndex]
+                    local finalWaypoint = destinationIndex == #waypoints
                     self.Navigation.LastResult = string.format(
-                        "Smooth tween • point %d/%d",
-                        index - 1,
+                        "Fast smooth tween • point %d/%d",
+                        destinationIndex - 1,
                         #waypoints - 1
                     )
 
@@ -1031,12 +1074,12 @@ function P:WalkToPosition(goalPosition, options)
                             return blocked and blockedWaypoint <= currentWaypoint
                         end
                     )
-
                     if not ok then
                         moved = false
                         failureReason = reason
                         break
                     end
+                    index = destinationIndex + 1
                 end
             end
         else
@@ -3452,7 +3495,7 @@ function P:CreateUI()
     settingsTab:CreateSection("General")
     bindToggle(settingsTab, "Anti AFK", "AntiAFK")
     settingsTab:CreateSection("Movement")
-    bindSlider(settingsTab, "Safe Tween Speed", "TweenSpeed", {12, 55}, 1, " studs/s")
+    bindSlider(settingsTab, "Fast Smooth Tween Speed", "TweenSpeed", {20, 360}, 5, " studs/s")
     settingsTab:CreateButton({
         Name = "Unload Script",
         Callback = function()
