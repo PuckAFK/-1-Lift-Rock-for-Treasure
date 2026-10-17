@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.8.0 - Ground Navigation + Sell Debug
+    Smart AutoFarm v1.8.1 - Protected-Shop Ground Detours and Height Fix
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.8.0",
+    Version = "1.8.1",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -450,11 +450,24 @@ function P:ProjectToGround(worldPosition, extraExclude)
         params.RespectCanCollide = true
     end)
 
-    local origin = worldPosition + Vector3.new(0, 35, 0)
-    local result = workspace:Raycast(origin, Vector3.new(0, -120, 0), params)
-    if result then
-        return result.Position
+    -- v1.8.0 could project a center-corridor waypoint at Y=0 while the
+    -- actual plaza is around Y=120. A ray starting 35 studs above Y=0
+    -- never touched the plaza, and returned a fake Y=0 path destination.
+    -- Use the observed player/map height as the ray's elevation reference.
+    local referenceY = worldPosition.Y
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if root then referenceY = math.max(referenceY, root.Position.Y) end
+    local map = workspace:FindFirstChild("Map")
+    local spawn = map and map:FindFirstChild("SpawnZone")
+    if spawn and spawn:IsA("BasePart") then
+        referenceY = math.max(referenceY, spawn.Position.Y)
     end
+    local origin = Vector3.new(worldPosition.X, referenceY + 55, worldPosition.Z)
+    local rayDepth = math.max(160, origin.Y - worldPosition.Y + 80)
+    local result = workspace:Raycast(origin, Vector3.new(0, -rayDepth, 0), params)
+    if result then return result.Position end
+    -- Never emit impossible ground destinations far below the live map.
+    if worldPosition.Y < referenceY - 45 then return nil end
     return worldPosition
 end
 
@@ -705,13 +718,149 @@ end
 
 function P:RouteCrossesMenuZone(startPos, endPos, allowedZone, padding)
     if not self.Settings.AvoidUnwantedShops then return false end
+    local margin = math.max(0, tonumber(padding) or 6)
     for _, entry in ipairs(self:GetMenuTriggerZones()) do
         if entry.Part ~= allowedZone
-            and self:SegmentIntersectsMenuZone(startPos, endPos, entry.Part, padding or 6) then
-            return true, entry
+            and self:SegmentIntersectsMenuZone(startPos, endPos, entry.Part, margin) then
+            local zone = entry.Part
+            local from = zone.CFrame:PointToObjectSpace(startPos)
+            local to = zone.CFrame:PointToObjectSpace(endPos)
+            local half = zone.Size * 0.5
+            local hx, hz = half.X + margin, half.Z + margin
+            local startX, startZ = math.abs(from.X) / math.max(0.2, hx),
+                math.abs(from.Z) / math.max(0.2, hz)
+            local endX, endZ = math.abs(to.X) / math.max(0.2, hx),
+                math.abs(to.Z) / math.max(0.2, hz)
+            local fromRadius = math.max(startX, startZ)
+            local toRadius = math.max(endX, endZ)
+            local movingOut = fromRadius <= 1.001 and toRadius > 1.1
+                and (from.X*(to.X-from.X) / math.max(1,hx*hx)
+                    + from.Z*(to.Z-from.Z) / math.max(1,hz*hz)) >= -0.01
+            -- A client rubber-banded onto an Aura/Sell pad must be able to
+            -- EXIT the forbidden volume. Only outward egress is exempt;
+            -- crossing into or through another protected shop remains blocked.
+            if not movingOut then return true, entry end
         end
     end
     return false
+end
+
+-- Build a ground-only detour around invisible shop triggers. The Roblox
+-- pathfinder sees walls but not non-collidable ZoneOpener regions, so its
+-- shortest route may repeatedly cut through Auras and fail. Construct a tiny
+-- visibility graph from padded trigger corners and select a safe short path.
+function P:FindGroundMenuDetour(fromRoot, toRoot, allowedZone)
+    if typeof(fromRoot) ~= "Vector3" or typeof(toRoot) ~= "Vector3" then
+        return nil
+    end
+    local _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root then return nil end
+    if not self:RouteCrossesMenuZone(fromRoot, toRoot, allowedZone, 5) then
+        return nil
+    end
+
+    local entries = {}
+    local center = (fromRoot + toRoot) * 0.5
+    local maxRange = (toRoot - fromRoot).Magnitude * 0.6 + 90
+    for _, entry in ipairs(self:GetMenuTriggerZones()) do
+        local part = entry.Part
+        if part ~= allowedZone
+            and (part.Position - center).Magnitude <= maxRange then
+            table.insert(entries, entry)
+        end
+    end
+    table.sort(entries, function(a,b)
+        return (a.Part.Position-center).Magnitude
+            < (b.Part.Position-center).Magnitude
+    end)
+    while #entries > 12 do table.remove(entries) end
+    if #entries == 0 then return nil end
+
+    local nodes = {
+        {Root=fromRoot},
+        {Root=toRoot},
+    }
+    for _, entry in ipairs(entries) do
+        local zone = entry.Part
+        local half = zone.Size * 0.5
+        -- The extra padding also clears the actual shop stall/roof footprint,
+        -- rather than merely skimming the edge of the invisible circle.
+        for _, sx in ipairs({-1,1}) do
+            for _, sz in ipairs({-1,1}) do
+                local corner = zone.CFrame:PointToWorldSpace(Vector3.new(
+                    sx*(half.X+13), 0, sz*(half.Z+13)))
+                local sample = Vector3.new(corner.X, fromRoot.Y, corner.Z)
+                local surface = self:ProjectToGround(sample)
+                local candidate = surface and self:GetTweenRootTarget(
+                    surface, humanoid, root)
+                if candidate and math.abs(candidate.Y-fromRoot.Y) <= 17
+                    and not self:DestinationHitsMenuZone(candidate, allowedZone) then
+                    table.insert(nodes, {Root=candidate, Surface=surface})
+                end
+            end
+        end
+    end
+    if #nodes <= 2 then return nil end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {root.Parent}
+    pcall(function() rayParams.RespectCanCollide = true end)
+    local function clearSegment(a,b)
+        if self:RouteCrossesMenuZone(a,b,allowedZone,5) then
+            return false
+        end
+        local delta = b-a
+        if delta.Magnitude <= 0.1 then return true end
+        -- Physics safety: don't replace blocked shop paths with wall clipping.
+        if workspace:Raycast(a,delta,rayParams) then return false end
+        if workspace:Raycast(a+Vector3.new(0,-1.0,0),delta,rayParams) then
+            return false
+        end
+        return true
+    end
+
+    local count = #nodes
+    local dist,prev,seen = {},{},{}
+    for i=1,count do dist[i]=math.huge end
+    dist[1]=0
+    for _=1,count do
+        local current,best=nil,math.huge
+        for i=1,count do
+            if not seen[i] and dist[i]<best then
+                current,best=i,dist[i]
+            end
+        end
+        if not current or current==2 then break end
+        seen[current]=true
+        local a=nodes[current].Root
+        for i=2,count do
+            if not seen[i] then
+                local b=nodes[i].Root
+                local step=(b-a).Magnitude
+                if step > 0.1 and step < 330 and clearSegment(a,b) then
+                    local cost=best+step
+                    if cost<dist[i] then
+                        dist[i],prev[i]=cost,current
+                    end
+                end
+            end
+        end
+    end
+    if not prev[2] or prev[2]==1 then return nil end
+    local reversed,current={},2
+    while current and current~=1 and #reversed<16 do
+        table.insert(reversed,current)
+        current=prev[current]
+    end
+    if current~=1 then return nil end
+    local result={}
+    for i=#reversed,2,-1 do
+        local node=nodes[reversed[i]]
+        if node.Surface then table.insert(result,node.Surface) end
+    end
+    if #result==0 or #result>9 then return nil end
+    return result
 end
 
 function P:DestinationHitsMenuZone(position, allowedZone)
@@ -1369,6 +1518,37 @@ function P:WalkToPosition(goalPosition, options)
         self.Navigation.Repaths = attempt - 1
         local projectedRoot = self:GetTweenRootTarget(projected, humanoid, root)
         local distance = projectedRoot and (root.Position - projectedRoot).Magnitude or 0
+        -- Route around invisible menu triggers before asking the pathfinder to
+        -- cross them again. Only real ground waypoints; absolutely no sky route.
+        if projectedRoot and attempt <= 3 then
+            local detour = self:FindGroundMenuDetour(
+                root.Position, projectedRoot, options.AllowedShopZone)
+            if detour then
+                self:DebugEvent("DETOUR", string.format(
+                    "Walking around protected shop triggers via %d ground waypoint(s)",
+                    #detour))
+                local progressed = false
+                for index, surface in ipairs(detour) do
+                    if not self:IsWalkTokenActive(token) then
+                        return finish(false, "Cancelled during shop detour")
+                    end
+                    self.Navigation.Waypoint = index
+                    local ok, reason = self:TweenWaypoint(surface,
+                        Enum.PathWaypointAction.Walk, token, 2.5)
+                    if not ok then
+                        self.Debug.LastRouteIssue = "Detour waypoint "..
+                            index..": "..tostring(reason)
+                        self:DebugEvent("DETOUR", self.Debug.LastRouteIssue)
+                        break
+                    end
+                    progressed = true
+                end
+                if progressed then
+                    -- Replan from the new safe side of the shop cluster.
+                    continue
+                end
+            end
+        end
         -- Ground-only pathfinding, including all travel to stages and shops.
         self.Navigation.LastResult = attempt == 1
             and "Planning tween route"
@@ -1627,11 +1807,33 @@ function P:WalkIntoZone(zone, intentionalShop)
         end
     end
 
+    -- Explicitly try all four interior-facing sides of a shop trigger.
+    -- An Aura pad can block the nearest side of Sell while the other side is open.
+    if intentionalShop and zone:IsA("BasePart") then
+        local half = zone.Size * 0.5
+        for _, side in ipairs({
+            Vector3.new(half.X*0.76,0,0),
+            Vector3.new(-half.X*0.76,0,0),
+            Vector3.new(0,0,half.Z*0.76),
+            Vector3.new(0,0,-half.Z*0.76),
+        }) do
+            local world=zone.CFrame:PointToWorldSpace(side)
+            local floor=self:ProjectToGround(world,zone)
+            if floor then
+                local _, h, r=self:GetCharacter()
+                local dest=h and r and self:GetTweenRootTarget(floor,h,r)
+                if dest and not self:DestinationHitsMenuZone(dest,zone) then
+                    table.insert(candidates,floor)
+                end
+            end
+        end
+    end
+
     for index, goal in ipairs(candidates) do
         if inside() then
             return true
         end
-        if intentionalShop and index > 3 then break end
+        if intentionalShop and index > 7 then break end
         self.Navigation.LastResult = index == 1 and "Entering zone" or ("Alternate zone entry " .. tostring(index - 1))
         local reached = self:WalkToPosition(goal, {
             AcceptanceRadius = 1.15,
