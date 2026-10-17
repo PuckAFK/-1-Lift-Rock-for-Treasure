@@ -35,7 +35,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.4",
+    Version = "1.7.5",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -76,6 +76,8 @@ local P = {
         Waypoint = 0,
         LastProgressAt = 0,
         LastDistance = 0,
+        AllowedShopZone = nil,
+        LastShopAvoid = 0,
     },
     Requirements = {
         Kind = "Scanning",
@@ -115,6 +117,7 @@ P.Settings = {
     PathRetries = 4,
     TweenSpeed = 600, -- New Farming-tab setting; legacy saved Settings speed is ignored. 20-750 studs/s.
     TweenWaypointSpacing = 8,
+    AvoidShopZones = true, -- Skip invisible shop trigger volumes on unrelated routes.
 
     -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
     MinPickupRarity = "Any",
@@ -377,12 +380,238 @@ function P:GetZoneWalkPoint(zone)
     return self:ProjectToGround(raw, zone)
 end
 
+-- The updated place has invisible, non-collidable ZoneOpener volumes under
+-- Workspace.Map.Shops: Sell, Arms, Upgrades, Auras and Trading. Raycasts miss
+-- these menu triggers, so avoid their *volumes* (not just solid buildings).
+function P:GetShopAvoidZones()
+    local map = self:Map()
+    local shops = map and map:FindFirstChild("Shops")
+    local zones = {}
+    if not shops then return zones end
+    for _, model in ipairs(shops:GetChildren()) do
+        local part = model:IsA("BasePart") and model
+            or model:FindFirstChild("Zone", true)
+        if part and part:IsA("BasePart") then
+            table.insert(zones, part)
+        end
+    end
+    return zones
+end
+
+function P:IsInShopAvoidVolume(zone, worldPoint, margin)
+    if not zone or not zone:IsA("BasePart") or typeof(worldPoint) ~= "Vector3" then
+        return false
+    end
+    local point = zone.CFrame:PointToObjectSpace(worldPoint)
+    local half = zone.Size * 0.5
+    local horizontal = tonumber(margin) or 7
+    return math.abs(point.X) <= half.X + horizontal
+        and math.abs(point.Z) <= half.Z + horizontal
+        and math.abs(point.Y) <= half.Y + 7
+end
+
+function P:ShopSegmentIntersects(fromRoot, toRoot, zone, margin)
+    if not zone or typeof(fromRoot) ~= "Vector3" or typeof(toRoot) ~= "Vector3" then
+        return false
+    end
+    -- Slab-intersection in local part coordinates handles rotated shop zones.
+    local a = zone.CFrame:PointToObjectSpace(fromRoot)
+    local b = zone.CFrame:PointToObjectSpace(toRoot)
+    local delta = b - a
+    local half = zone.Size * 0.5
+    local pad = tonumber(margin) or 7
+    local bounds = {half.X + pad, half.Y + 7, half.Z + pad}
+    local origin = {a.X, a.Y, a.Z}
+    local ray = {delta.X, delta.Y, delta.Z}
+    local entry, exit = 0, 1
+    for axis = 1, 3 do
+        local d = ray[axis]
+        if math.abs(d) < 0.00001 then
+            if math.abs(origin[axis]) > bounds[axis] then return false end
+        else
+            local first = (-bounds[axis] - origin[axis]) / d
+            local last = (bounds[axis] - origin[axis]) / d
+            if first > last then first, last = last, first end
+            entry = math.max(entry, first)
+            exit = math.min(exit, last)
+            if entry > exit then return false end
+        end
+    end
+    return true
+end
+
+function P:CrossesUnwantedShopZone(fromRoot, toRoot)
+    if self.Settings.AvoidShopZones == false then return false end
+    for _, zone in ipairs(self:GetShopAvoidZones()) do
+        if zone ~= self.Navigation.AllowedShopZone
+            and self:ShopSegmentIntersects(fromRoot, toRoot, zone, 7) then
+            local fromLocal = zone.CFrame:PointToObjectSpace(fromRoot)
+            local toLocal = zone.CFrame:PointToObjectSpace(toRoot)
+            local xScale = math.max(1, zone.Size.X * 0.5 + 7)
+            local zScale = math.max(1, zone.Size.Z * 0.5 + 7)
+            local startRadius = (fromLocal.X / xScale) ^ 2 + (fromLocal.Z / zScale) ^ 2
+            local endRadius = (toLocal.X / xScale) ^ 2 + (toLocal.Z / zScale) ^ 2
+            -- Permit only *outward* egress if a previous server correction or
+            -- an intentional shop visit has left us inside a trigger.
+            local isExiting = self:IsInShopAvoidVolume(zone, fromRoot, 7)
+                and endRadius > startRadius + 0.06
+                and toRoot.Y >= fromRoot.Y - 2
+            if not isExiting then return true, zone end
+        end
+    end
+    return false
+end
+
+function P:CloseUnexpectedShopMenus()
+    -- Only close game-native shop zone menus while not deliberately shopping.
+    -- Use InterfaceModule.CloseFrame so the game's own HUD/blur state restores.
+    if self.Navigation.AllowedShopZone then return end
+    local gui = self.Player:FindFirstChild("PlayerGui")
+    local main = gui and gui:FindFirstChild("MainUI")
+    local menus = main and main:FindFirstChild("Menus")
+    if not menus then return end
+    local names = {Sell = true, Arms = true, Upgrades = true,
+        Auras = true, TradingSelectPlayer = true, Shop = true}
+    for _, zone in ipairs(self:GetShopAvoidZones()) do
+        local name = zone:GetAttribute("Menu")
+        if type(name) == "string" and name ~= "" then
+            names[name] = true
+        end
+    end
+    local interface = self.M.InterfaceModule
+    if not interface then
+        local playerScripts = self.Player:FindFirstChild("PlayerScripts")
+        local modules = playerScripts and playerScripts:FindFirstChild("ClientModules")
+        local module = modules and modules:FindFirstChild("InterfaceModule")
+        if module then
+            local ok, value = pcall(require, module)
+            if ok and type(value) == "table" then
+                interface = value
+                self.M.InterfaceModule = value
+            end
+        end
+    end
+    for name in pairs(names) do
+        local panel = menus:FindFirstChild(name)
+        if panel and panel:IsA("GuiObject") and panel.Visible then
+            if interface and type(interface.CloseFrame) == "function" then
+                pcall(interface.CloseFrame, name)
+            else
+                -- Fallback only for the specific accidental shop panel.
+                panel.Visible = false
+            end
+            self.Navigation.LastShopAvoid = os.clock()
+        end
+    end
+end
+
+-- Sky travel is only used when a ground route crosses a shop trigger volume.
+-- It rises above the highest shop zone, crosses overhead, then descends onto
+-- the REAL destination. No instant CFrame teleport and no fake zone arrival.
+function P:TweenAirLeg(destinationRoot, token)
+    local _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root or humanoid.Health <= 0 then return false, "character" end
+    if typeof(destinationRoot) ~= "Vector3" then return false, "goal" end
+    if not self:IsWalkTokenActive(token) then return false, "cancelled" end
+    local delta = destinationRoot - root.Position
+    if delta.Magnitude < 2 then return true end
+
+    -- Physical obstructions, e.g. a shop roof, must not be flown through.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {root.Parent}
+    pcall(function() rayParams.RespectCanCollide = true end)
+    if workspace:Raycast(root.Position, delta, rayParams) then
+        return false, "air obstruction"
+    end
+    if not self:BeginTweenBody(token, humanoid, root) then return false, "character" end
+    local facing = Vector3.new(delta.X, 0, delta.Z)
+    local cf = facing.Magnitude > 0.1
+        and CFrame.lookAt(destinationRoot, destinationRoot + facing.Unit, Vector3.yAxis)
+        or CFrame.new(destinationRoot) * root.CFrame.Rotation
+    local speed = math.clamp(tonumber(self.Settings.TweenSpeed) or 600, 20, 750)
+    local duration = math.max(0.04, delta.Magnitude / speed)
+    local tween = self.S.TweenService:Create(root,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = cf})
+    self.Navigation.ActiveTween = tween
+    local done, state = false, nil
+    local connection = tween.Completed:Connect(function(result)
+        done, state = true, result
+    end)
+    tween:Play()
+    local deadline = os.clock() + duration + math.max(0.9, duration * 0.5)
+    while self:IsWalkTokenActive(token) and not done and os.clock() < deadline do
+        local _, h, r = self:GetCharacter()
+        if not h or not r or h.Health <= 0 then break end
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+        task.wait(0.016)
+    end
+    if not done then pcall(function() tween:Cancel() end) end
+    connection:Disconnect()
+    if self.Navigation.ActiveTween == tween then self.Navigation.ActiveTween = nil end
+    local _, h, r = self:GetCharacter()
+    if not self:IsWalkTokenActive(token) then return false, "cancelled" end
+    if not h or not r or h.Health <= 0 then return false, "character" end
+    local residual = (r.Position - destinationRoot).Magnitude
+    if state == Enum.PlaybackState.Completed and residual <= 4 then
+        return true
+    end
+    return false, "server correction"
+end
+
+function P:FlyOverShopZones(goalSurface, token, arrivalPredicate)
+    local _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root or humanoid.Health <= 0 then return false, "character" end
+    local endRoot = self:GetTweenRootTarget(goalSurface, humanoid, root)
+    if not endRoot then return false, "goal" end
+    for _, zone in ipairs(self:GetShopAvoidZones()) do
+        if zone ~= self.Navigation.AllowedShopZone
+            and self:IsInShopAvoidVolume(zone, endRoot, 7) then
+            return false, "destination overlaps shop trigger"
+        end
+    end
+    local altitude = math.max(root.Position.Y, endRoot.Y) + 32
+    for _, zone in ipairs(self:GetShopAvoidZones()) do
+        local half = zone.Size * 0.5
+        local cf = zone.CFrame
+        local upperY = zone.Position.Y
+            + math.abs(cf.RightVector.Y) * half.X
+            + math.abs(cf.UpVector.Y) * half.Y
+            + math.abs(cf.LookVector.Y) * half.Z
+        altitude = math.max(altitude, upperY + 26)
+    end
+    local ascent = Vector3.new(root.Position.X, altitude, root.Position.Z)
+    local crossing = Vector3.new(endRoot.X, altitude, endRoot.Z)
+    -- The two overhead legs stay outside all shop triggers once above them.
+    if self:CrossesUnwantedShopZone(ascent, crossing)
+        or self:CrossesUnwantedShopZone(crossing, endRoot) then
+        return false, "unsafe shop descent"
+    end
+    self:SetStatus("Routing above shop triggers...", "MOVE")
+    local ok, reason = self:TweenAirLeg(ascent, token)
+    if not ok then return false, reason end
+    self:CloseUnexpectedShopMenus()
+    ok, reason = self:TweenAirLeg(crossing, token)
+    if not ok then return false, reason end
+    ok, reason = self:TweenAirLeg(endRoot, token)
+    if not ok then return false, reason end
+    self:CloseUnexpectedShopMenus()
+    if type(arrivalPredicate) == "function" then
+        return self:WalkArrivalSatisfied(arrivalPredicate), "arrival zone check"
+    end
+    return true
+end
+
 function P:StopWalking()
     self.Navigation.Token = (self.Navigation.Token or 0) + 1
     self.Navigation.Destination = nil
     self.Navigation.LastResult = "Stopped"
     self.Navigation.Busy = false
     self.Navigation.Waypoint = 0
+    self.Navigation.AllowedShopZone = nil
 
     local activeTween = self.Navigation.ActiveTween
     self.Navigation.ActiveTween = nil
@@ -559,6 +788,10 @@ function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
         return true
     end
 
+    if self:CrossesUnwantedShopZone(fromRoot, toRoot) then
+        return false
+    end
+
     local upperHit = workspace:Raycast(fromRoot, delta, params)
     if upperHit then
         return false
@@ -679,6 +912,11 @@ function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPred
         else
             targetCFrame = CFrame.new(targetPosition) * root.CFrame.Rotation
         end
+    end
+
+    -- Invisible ZoneOpener triggers are not tested by physical raycasts.
+    if self:CrossesUnwantedShopZone(root.Position, targetPosition) then
+        return waypointResult(false, "shop zone")
     end
 
     -- Re-check collision-free line immediately before moving along each path segment.
@@ -833,6 +1071,12 @@ function P:WalkToPosition(goalPosition, options)
         end
     end
 
+    -- The game's InterfaceModule closes an accidental modal correctly, rather
+    -- than simply hiding the panel and leaving modal state/blur active.
+    if not self.Navigation.AllowedShopZone then
+        self:CloseUnexpectedShopMenus()
+    end
+
     -- A new destination owns the movement controller and cancels any previous tween.
     self.Navigation.Token = (self.Navigation.Token or 0) + 1
     local token = self.Navigation.Token
@@ -881,6 +1125,15 @@ function P:WalkToPosition(goalPosition, options)
             self.Navigation.Waypoint = 0
         end
         return result
+    end
+
+    -- Rise, cross overhead and descend before attempting pathfinding through
+    -- a trigger zone. Fall back to safe pathfinding if sky is obstructed.
+    if self:CrossesUnwantedShopZone(root.Position,
+        self:GetTweenRootTarget(projected, humanoid, root)) then
+        local skyOK = self:FlyOverShopZones(projected, token, arrivalPredicate)
+        if skyOK then return finish(true, "Shop-safe sky arrival") end
+        self:CloseUnexpectedShopMenus()
     end
 
     local maxAttempts = math.clamp(
@@ -1064,6 +1317,11 @@ function P:WalkToPosition(goalPosition, options)
 
         if blockedConnection then
             pcall(function() blockedConnection:Disconnect() end)
+        end
+
+        if not moved and failureReason == "shop zone" then
+            local skyOK = self:FlyOverShopZones(projected, token, arrivalPredicate)
+            if skyOK then return finish(true, "Shop-safe sky arrival") end
         end
 
         if moved then
@@ -2453,11 +2711,20 @@ function P:GoToShopZone(shopName)
     local zone = shop and (shop:FindFirstChild("Zone") or shop:FindFirstChild("Zone", true))
     if zone and zone:IsA("BasePart") then
         self:SetStatus("Moving to " .. tostring(shopName) .. " shop...", "MOVE")
-        local reached = self:WalkIntoZone(zone)
-        if reached then
-            task.wait(0.2)
+        -- Permit crossing only the shop we intentionally need for a purchase.
+        self.Navigation.AllowedShopZone = zone
+        local ok, reached = pcall(function()
+            return self:WalkIntoZone(zone)
+        end)
+        self.Navigation.AllowedShopZone = nil
+        if ok and reached then
+            task.wait(0.10)
+            -- Server shop actions use authenticated remotes. The visual menu
+            -- is not required for purchasing, and can trap auto movement.
+            self:CloseUnexpectedShopMenus()
+            return true
         end
-        return reached
+        return false
     end
     self.LastError = "Missing shop zone: " .. tostring(shopName)
     return false
@@ -3258,6 +3525,24 @@ function P:InstallTapLoop()
     end)
 end
 
+function P:InstallShopMenuRecovery()
+    self:Spawn(function()
+        while self.Alive do
+            if self.Settings.Enabled and not self.Navigation.AllowedShopZone then
+                -- A surprise ZoneOpener menu can stop keyboard/game input until
+                -- dismissed. Use the native close API, but do not interrupt a
+                -- legitimate transaction in progress.
+                local phase = tostring(self.Phase or "")
+                if self.Navigation.Busy or (phase ~= "SELL" and phase ~= "UPGRADE"
+                    and phase ~= "ECONOMY") then
+                    pcall(function() self:CloseUnexpectedShopMenus() end)
+                end
+            end
+            task.wait(0.55)
+        end
+    end)
+end
+
 function P:InstallAntiAFK()
     self:Connect(self.Player.Idled, function()
         if not self.Alive or not self.Settings.AntiAFK then
@@ -3635,6 +3920,9 @@ local function Bootstrap()
 
     P:SetStatus("Installing anti-AFK...", "BOOT")
     P:InstallAntiAFK()
+
+    P:SetStatus("Installing shop-popup recovery...", "BOOT")
+    P:InstallShopMenuRecovery()
 
     P:SetStatus("Synchronizing special spawns...", "BOOT")
     P:RefreshSpecialSpawns(true)
