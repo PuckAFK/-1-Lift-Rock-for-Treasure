@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.8.1 - Protected-Shop Ground Detours and Height Fix
+    Smart AutoFarm v1.8.2 - Stage Elevation Transit / Ground-Only Shops
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.8.1",
+    Version = "1.8.2",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -1373,6 +1373,59 @@ function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPred
     return waypointResult(false, "corrected")
 end
 
+-- Only rock stages occupy disconnected vertical platform levels. This
+-- transition never runs for shops, plots, treasure pickup or normal travel.
+-- Stage 1 -> Stage 2 is ~58 studs up, unreachable by ground PathfindingService.
+function P:TravelStageElevation(surface, token, predicate)
+    local _, humanoid, root = self:GetCharacter()
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return false, "character"
+    end
+    local goal = self:GetTweenRootTarget(surface, humanoid, root)
+    if not goal then return false, "no stage goal" end
+    if math.abs(goal.Y-root.Position.Y) < 18 then
+        return false, "not an elevation change"
+    end
+    if self:DestinationHitsMenuZone(root.Position)
+        or self:DestinationHitsMenuZone(goal) then
+        return false, "stage transition intersects shop area"
+    end
+    local offset = self:GetRootGroundOffset(humanoid, root)
+    local top = math.max(root.Position.Y, goal.Y) + 8
+    local steps = {
+        {Label = "rise", Point = Vector3.new(root.Position.X,top,root.Position.Z)},
+        {Label = "cross", Point = Vector3.new(goal.X,top,goal.Z)},
+        {Label = "land", Point = goal},
+    }
+    self:DebugEvent("STAGE",string.format(
+        "Stage platform transition: from Y %.1f to %.1f via %.1f",
+        root.Position.Y,goal.Y,top))
+    for index, step in ipairs(steps) do
+        if not self:IsWalkTokenActive(token) then return false,"cancelled" end
+        local _, h, r = self:GetCharacter()
+        if not h or not r or h.Health<=0 then return false,"character" end
+        if self:RouteCrossesMenuZone(r.Position,step.Point,nil,5) then
+            return false,"stage transition would cross shop trigger"
+        end
+        local targetSurface=step.Point-Vector3.new(0,offset,0)
+        self.Navigation.LastResult="Stage transit "..step.Label
+        local ok,reason=self:TweenWaypoint(targetSurface,
+            Enum.PathWaypointAction.Walk,token,
+            index==#steps and 2.0 or 2.5,
+            index==#steps and predicate or nil)
+        if not ok then
+            local why="stage "..step.Label.." failed: "..tostring(reason)
+            self:DebugEvent("STAGE",why)
+            return false,why
+        end
+    end
+    if type(predicate)=="function" then
+        return self:WalkArrivalSatisfied(predicate),
+            "platform reached but stage zone not entered"
+    end
+    return true,"stage level reached"
+end
+
 function P:WalkToPosition(goalPosition, options)
     options = options or {}
     if typeof(goalPosition) ~= "Vector3" then
@@ -1488,7 +1541,17 @@ function P:WalkToPosition(goalPosition, options)
         8
     )
 
-    -- Ground only: no ascent or sky-hop loop and no extra airborne retries.
+    -- A stage-only vertical change is essential for floating rock platforms.
+    -- Shop movement and all ordinary routes remain ground/pathfinding-only.
+    if options.StageElevation == true and projectedRoot
+        and math.abs(projectedRoot.Y-root.Position.Y) >= 18 then
+        local ok, reason=self:TravelStageElevation(projected,token,arrivalPredicate)
+        if ok then return finish(true,"Reached elevated rock platform") end
+        self.Debug.LastRouteIssue=tostring(reason)
+        return finish(false,"Stage level route: "..tostring(reason))
+    end
+
+    -- Ground only for shop zones, plots and same-height waypoints.
     for attempt = 1, maxAttempts do
         if not self:IsWalkTokenActive(token) then
             return finish(false, "Cancelled")
@@ -1839,6 +1902,10 @@ function P:WalkIntoZone(zone, intentionalShop)
             AcceptanceRadius = 1.15,
             Exclude = zone,
             AllowedShopZone = intentionalShop and zone or nil,
+            StageElevation = not intentionalShop
+                and zone.Name == "LiftZone"
+                and zone.Parent and zone.Parent:IsA("Model")
+                and tonumber(zone.Parent:GetAttribute("StageId")) ~= nil,
             MaxAttempts = intentionalShop and 2 or (index == 1 and 4 or 2),
             ArrivalPredicate = inside,
         })
@@ -2034,6 +2101,27 @@ function P:MoveToSpawn()
         return r and self:IsPointInsidePart(zone,r.Position,0.3)==true
     end
     if inside() then return true end
+    -- From high rock stages, descend to Stage 1 on the STAGE side before
+    -- routing through the shops at ground level. No shop rooftop flying.
+    local _, h, r = self:GetCharacter()
+    local firstStage=self:GetStage(1)
+    local firstZone=firstStage and firstStage:FindFirstChild("LiftZone")
+    if h and r and firstZone and firstZone:IsA("BasePart") then
+        local ground=self:ProjectToGround(firstZone.Position,firstZone)
+        local target=ground and self:GetTweenRootTarget(ground,h,r)
+        if target and r.Position.Y>target.Y+18 then
+            self:SetStatus("Descending onto Stage 1 before banking...","MOVE")
+            self:DebugEvent("STAGE","Return: descend on Stage 1 side, not shop roofs")
+            if not self:WalkToPosition(ground,{
+                StageElevation=true,Exclude=firstZone,MaxAttempts=2,
+                AcceptanceRadius=3,
+            }) then
+                self.LastError="Could not descend to Stage 1 for bank"
+                self:DebugEvent("FAIL",self.LastError)
+                return false
+            end
+        end
+    end
     local bankPoint=self:GetSafeSpawnBankPoint(zone)
     if bankPoint then
         local ok=self:WalkToPosition(bankPoint,{
@@ -2653,6 +2741,7 @@ function P:LiftStage(stageId)
     -- Moving between rocks now takes real tween travel time, not an instant teleport.
     local deadline = os.clock() + math.clamp(estimated * 2.15 + 22, 30, 150)
     local retries = 0
+    local failedEntries = 0
 
     while self.Alive and self.Settings.Enabled and self.Settings.AutoLift and os.clock() < deadline do
         if self:IsStageCleared(stageId) then
@@ -2676,9 +2765,20 @@ function P:LiftStage(stageId)
 
             local reached = self:WalkIntoZone(zone)
             if not reached then
-                self.LastError = "Could not path into Stage " .. tostring(stageId) .. " LiftZone"
+                failedEntries += 1
+                self.LastError="Could not enter Stage "..tostring(stageId)
+                    ..": "..tostring(self.Debug.LastRouteIssue or "route failed")
+                self:DebugEvent("STAGE",self.LastError)
+                -- Stop pointless repeated attempts: keep already-cleared
+                -- rewards for collection/banking rather than staying stuck.
+                if failedEntries>=2 then
+                    self:SetStatus("Stage "..tostring(stageId)
+                        .." unreachable; collecting current rewards","RECOVER")
+                    break
+                end
                 task.wait(0.2)
             else
+                failedEntries = 0
                 self:SetStatus(
                     string.format("Lifting Stage %d • %ss estimated", stageId, self:Compact(math.max(0.1, weight / math.max(1, self:CurrentPower())))),
                     "LIFT"
