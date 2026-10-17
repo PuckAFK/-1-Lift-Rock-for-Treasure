@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.2 - Fast Smooth Tween + Rarity Filter
+    Smart AutoFarm v1.7.3 - Ultra Fast Smooth Tween + Rarity Filter
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -33,7 +33,7 @@
       * Authoritative special-spawn snapshot rebuild with revision-safe delta handling
       * Requirement-aware progression purchases that bypass optional budgets when actually needed
       * Automatic cash/power milestone planning for backpack, arms, rebirths and training unlocks
-      * Fast configurable smooth tween (20-360 studs/s; 180 default), path string-pulling and continuous collision safety
+      * Ultra-fast configurable smooth tween (20-750 studs/s; 600 default), path string-pulling and continuous collision safety
       * PuckUI v3 shared interface loaded from the canonical PuckAFK/Puck-Loader source
 
     The server is still authoritative: remotes are called with the same argument shapes used by the game,
@@ -76,7 +76,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.2",
+    Version = "1.7.3",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -154,7 +154,7 @@ P.Settings = {
     -- is restored on route completion, pause, respawn, error, and unload.
     WalkAcceptanceRadius = 2.75,
     PathRetries = 4,
-    TweenSpeed = 180, -- Fast default; adjustable in Settings from 20 to 360 studs/s.
+    TweenSpeed = 600, -- Ultra-fast default; adjustable in Settings from 20 to 750 studs/s.
     TweenWaypointSpacing = 8,
 
     -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
@@ -681,7 +681,7 @@ function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPred
 
     -- Keep velocity continuous across adjacent waypoints: one constant rate,
     -- smooth CFrame rotation, no easing slowdown at every turn.
-    local speed = math.clamp(tonumber(self.Settings.TweenSpeed) or 180, 20, 360)
+    local speed = math.clamp(tonumber(self.Settings.TweenSpeed) or 600, 20, 750)
     local duration = math.max(0.04, distance / speed)
 
     -- Jump waypoints get a shallow two-part arc instead of snapping vertically.
@@ -3495,7 +3495,7 @@ function P:CreateUI()
     settingsTab:CreateSection("General")
     bindToggle(settingsTab, "Anti AFK", "AntiAFK")
     settingsTab:CreateSection("Movement")
-    bindSlider(settingsTab, "Fast Smooth Tween Speed", "TweenSpeed", {20, 360}, 5, " studs/s")
+    bindSlider(settingsTab, "Fast Smooth Tween Speed", "TweenSpeed", {20, 750}, 10, " studs/s")
     settingsTab:CreateButton({
         Name = "Unload Script",
         Callback = function()
