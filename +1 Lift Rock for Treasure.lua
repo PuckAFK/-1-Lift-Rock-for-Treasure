@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.8.2 - Stage Elevation Transit / Ground-Only Shops
+    Smart AutoFarm v1.9.0 - Instant Safe Teleport + Anti-Fling
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -30,12 +30,12 @@
       * Death / reset / stalled lift recovery
       * Game-native StoneIncome ROI model blended with live-run limits
       * Snapshot progress recovery and stale special-spawn removal
-      * Collision-aware, path-routed safe tween travel to lift / training / shops / plot
+      * Direct collision-checked teleport to lift zones, shops, spawn, training and plots
       * Mid-run/reload recovery without prematurely banking a partially filled backpack
       * Authoritative special-spawn snapshot rebuild with revision-safe delta handling
       * Requirement-aware progression purchases that bypass optional budgets when actually needed
       * Automatic cash/power milestone planning for backpack, arms, rebirths and training unlocks
-      * Ultra-fast configurable smooth tween (20-750 studs/s; 600 default), path string-pulling and continuous collision safety
+      * Anti-fling: temporary collision isolation, one-frame anchor, velocity reset, character state restoration
       * PuckUI v3 shared interface loaded from the canonical PuckAFK/Puck-Loader source
 
     The server is still authoritative: remotes are called with the same argument shapes used by the game,
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.8.2",
+    Version = "1.9.0",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -157,13 +157,10 @@ P.Settings = {
     PushNewStages = true,
     AntiAFK = true,
 
-    -- Fast, continuously collision-isolated pathfinding + smooth tween movement.
-    -- The HRP remains non-collidable only while traversing a route; collision state
-    -- is restored on route completion, pause, respawn, error, and unload.
+    -- Instant teleport instead of tweening. No speed setting is needed.
     WalkAcceptanceRadius = 2.75,
     PathRetries = 4,
-    TweenSpeed = 600, -- New Farming-tab setting; legacy saved Settings speed is ignored. 20-750 studs/s.
-    TweenWaypointSpacing = 8,
+    TeleportSettleSeconds = 0.12,
     AvoidUnwantedShops = true, -- Always enabled: do not cut across tagged shop/menu zones.
     AutoDismissShopMenus = true, -- Restore controls when a shop popup blocks AFK farming.
     DebugConsole = true, -- Detailed tagged logs; toggle in the Debug tab.
@@ -210,8 +207,6 @@ P.S = {
     Players = game:GetService("Players"),
     ReplicatedStorage = game:GetService("ReplicatedStorage"),
     CollectionService = game:GetService("CollectionService"),
-    PathfindingService = game:GetService("PathfindingService"),
-    TweenService = game:GetService("TweenService"),
     VirtualUser = game:GetService("VirtualUser"),
 }
 P.Player = P.S.Players.LocalPlayer
@@ -325,12 +320,11 @@ function P:DebugSnapshot()
     local allowed = nav.AllowedShopZone
     local lastError = tostring(self.LastError or "none")
     return string.format(
-        "Version %s  |  phase %s\nStatus: %s\nPosition: %s\nDestination: %s\nNavigation: %s; busy=%s; repaths=%s; waypoint=%s\nShop permission: %s  |  speed=%s\nLast navigation failure: %s\nLast error: %s",
+        "Version %s  |  phase %s\nStatus: %s\nPosition: %s\nDestination: %s\nNavigation: %s; busy=%s; repaths=%s; waypoint=%s\nShop permission: %s  |  Instant Safe TP\nLast navigation failure: %s\nLast error: %s",
         self.Version, tostring(self.Phase), tostring(self.Status),
         pos(position), pos(nav.Destination), tostring(nav.LastResult),
         tostring(nav.Busy), tostring(nav.Repaths), tostring(nav.Waypoint),
         allowed and allowed:GetFullName() or "none",
-        tostring(self.Settings.TweenSpeed),
         tostring(self.Debug.LastRouteIssue or "none"), lastError
     )
 end
@@ -500,37 +494,19 @@ end
 function P:StopWalking()
     self.Navigation.Token = (self.Navigation.Token or 0) + 1
     self.Navigation.Destination = nil
-    self.Navigation.LastResult = "Stopped"
     self.Navigation.Busy = false
+    self.Navigation.LastResult = "Stopped"
     self.Navigation.Waypoint = 0
     self.Navigation.AllowedShopZone = nil
-    self.Navigation.SkyTravel = false
-    self.Navigation.SkyAscent = false
-
-    local activeTween = self.Navigation.ActiveTween
-    self.Navigation.ActiveTween = nil
-    if activeTween then
-        pcall(function()
-            activeTween:Cancel()
-        end)
-    end
-    self:ReleaseTweenBody()
-
-    local character = self.Player.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    if humanoid then
-        pcall(function()
-            humanoid.Sit = false
-            humanoid.AutoRotate = true
-        end)
-    end
-    if root then
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end)
-    end
+    self:ReleaseTeleportBody()
+    local ch = self.Player.Character
+    local root = ch and ch:FindFirstChild("HumanoidRootPart")
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    if hum then pcall(function() hum.Sit=false; hum.AutoRotate=true end) end
+    if root then pcall(function()
+        root.AssemblyLinearVelocity=Vector3.zero
+        root.AssemblyAngularVelocity=Vector3.zero
+    end) end
 end
 
 function P:IsWalkTokenActive(token)
@@ -559,7 +535,7 @@ function P:GetRootGroundOffset(humanoid, root)
     return math.max(2.25, hip + halfRoot)
 end
 
-function P:GetTweenRootTarget(surfacePosition, humanoid, root)
+function P:GetTeleportRootTarget(surfacePosition, humanoid, root)
     if typeof(surfacePosition) ~= "Vector3" then
         return nil
     end
@@ -567,73 +543,47 @@ function P:GetTweenRootTarget(surfacePosition, humanoid, root)
     return Vector3.new(surfacePosition.X, surfacePosition.Y + yOffset, surfacePosition.Z)
 end
 
--- Tween physics transaction: make intermediate moves kinematic instead of letting
--- the character collide with rocks at high speed and fling into the sky.
--- Pathfinding, line checks and regular destination validation still prevent wall shortcuts.
-function P:ReleaseTweenBody(token)
-    local state = self.Navigation.MotionState
-    if not state or (token ~= nil and state.Token ~= token) then
-        return
-    end
-    self.Navigation.MotionState = nil
-    local root = state.Root
-    local humanoid = state.Humanoid
-    if root and root.Parent then
+-- Anti-fling teleport transaction. All original body collision/anchor states
+-- are restored even if a PivotTo fails or the script is unloaded mid-action.
+function P:ReleaseTeleportBody()
+    local state=self.Navigation.MotionState
+    if not state then return end
+    self.Navigation.MotionState=nil
+    if state.Root and state.Root.Parent then
         pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.Anchored = state.WasAnchored
+            state.Root.AssemblyLinearVelocity=Vector3.zero
+            state.Root.AssemblyAngularVelocity=Vector3.zero
+            state.Root.Anchored=state.Anchored
         end)
     end
-    for part, wasCollidable in pairs(state.Collisions) do
-        if part and part.Parent then
-            pcall(function()
-                part.CanCollide = wasCollidable
-            end)
-        end
+    for part,old in pairs(state.Collisions) do
+        if part and part.Parent then pcall(function() part.CanCollide=old end) end
     end
-    if humanoid and humanoid.Parent then
+    if state.Humanoid and state.Humanoid.Parent then
         pcall(function()
-            humanoid.AutoRotate = state.AutoRotate
-            humanoid.Sit = false
+            state.Humanoid.AutoRotate=state.AutoRotate
+            state.Humanoid.Sit=false
         end)
     end
 end
 
-function P:BeginTweenBody(token, humanoid, root)
-    -- Keep the collision-isolated controller for the entire route: toggling
-    -- CanCollide at every small waypoint causes micro-pauses and fling impulses.
-    local existing = self.Navigation.MotionState
-    if existing and existing.Token == token and existing.Root == root
-        and existing.Humanoid == humanoid and root.Parent then
-        return true
-    end
-    self:ReleaseTweenBody()
-    local character = root and root.Parent
-    if not root or not humanoid or not character then
-        return false
-    end
-    local state = {
-        Token = token,
-        Root = root,
-        Humanoid = humanoid,
-        WasAnchored = root.Anchored,
-        AutoRotate = humanoid.AutoRotate,
-        Collisions = {},
-    }
-    self.Navigation.MotionState = state
-    for _, object in ipairs(character:GetDescendants()) do
-        if object:IsA("BasePart") then
-            state.Collisions[object] = object.CanCollide
-            object.CanCollide = false
+function P:BeginTeleportBody(root,humanoid)
+    self:ReleaseTeleportBody()
+    if not root or not root.Parent or root.Anchored
+        or not humanoid or humanoid.Health<=0 then return false end
+    local state={Root=root,Humanoid=humanoid,Anchored=root.Anchored,
+        AutoRotate=humanoid.AutoRotate,Collisions={}}
+    self.Navigation.MotionState=state
+    for _,part in ipairs(root.Parent:GetDescendants()) do
+        if part:IsA("BasePart") then
+            state.Collisions[part]=part.CanCollide
+            part.CanCollide=false
         end
     end
-    humanoid.Sit = false
-    humanoid.AutoRotate = false
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
-    -- Remain unanchored: network-owned character movement must replicate to the
-    -- server for zone checks. Anchoring the local root can break replication.
+    humanoid.Sit=false
+    humanoid.AutoRotate=false
+    root.AssemblyLinearVelocity=Vector3.zero
+    root.AssemblyAngularVelocity=Vector3.zero
     return true
 end
 
@@ -745,124 +695,7 @@ function P:RouteCrossesMenuZone(startPos, endPos, allowedZone, padding)
     return false
 end
 
--- Build a ground-only detour around invisible shop triggers. The Roblox
--- pathfinder sees walls but not non-collidable ZoneOpener regions, so its
--- shortest route may repeatedly cut through Auras and fail. Construct a tiny
--- visibility graph from padded trigger corners and select a safe short path.
-function P:FindGroundMenuDetour(fromRoot, toRoot, allowedZone)
-    if typeof(fromRoot) ~= "Vector3" or typeof(toRoot) ~= "Vector3" then
-        return nil
-    end
-    local _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root then return nil end
-    if not self:RouteCrossesMenuZone(fromRoot, toRoot, allowedZone, 5) then
-        return nil
-    end
-
-    local entries = {}
-    local center = (fromRoot + toRoot) * 0.5
-    local maxRange = (toRoot - fromRoot).Magnitude * 0.6 + 90
-    for _, entry in ipairs(self:GetMenuTriggerZones()) do
-        local part = entry.Part
-        if part ~= allowedZone
-            and (part.Position - center).Magnitude <= maxRange then
-            table.insert(entries, entry)
-        end
-    end
-    table.sort(entries, function(a,b)
-        return (a.Part.Position-center).Magnitude
-            < (b.Part.Position-center).Magnitude
-    end)
-    while #entries > 12 do table.remove(entries) end
-    if #entries == 0 then return nil end
-
-    local nodes = {
-        {Root=fromRoot},
-        {Root=toRoot},
-    }
-    for _, entry in ipairs(entries) do
-        local zone = entry.Part
-        local half = zone.Size * 0.5
-        -- The extra padding also clears the actual shop stall/roof footprint,
-        -- rather than merely skimming the edge of the invisible circle.
-        for _, sx in ipairs({-1,1}) do
-            for _, sz in ipairs({-1,1}) do
-                local corner = zone.CFrame:PointToWorldSpace(Vector3.new(
-                    sx*(half.X+13), 0, sz*(half.Z+13)))
-                local sample = Vector3.new(corner.X, fromRoot.Y, corner.Z)
-                local surface = self:ProjectToGround(sample)
-                local candidate = surface and self:GetTweenRootTarget(
-                    surface, humanoid, root)
-                if candidate and math.abs(candidate.Y-fromRoot.Y) <= 17
-                    and not self:DestinationHitsMenuZone(candidate, allowedZone) then
-                    table.insert(nodes, {Root=candidate, Surface=surface})
-                end
-            end
-        end
-    end
-    if #nodes <= 2 then return nil end
-
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    rayParams.FilterDescendantsInstances = {root.Parent}
-    pcall(function() rayParams.RespectCanCollide = true end)
-    local function clearSegment(a,b)
-        if self:RouteCrossesMenuZone(a,b,allowedZone,5) then
-            return false
-        end
-        local delta = b-a
-        if delta.Magnitude <= 0.1 then return true end
-        -- Physics safety: don't replace blocked shop paths with wall clipping.
-        if workspace:Raycast(a,delta,rayParams) then return false end
-        if workspace:Raycast(a+Vector3.new(0,-1.0,0),delta,rayParams) then
-            return false
-        end
-        return true
-    end
-
-    local count = #nodes
-    local dist,prev,seen = {},{},{}
-    for i=1,count do dist[i]=math.huge end
-    dist[1]=0
-    for _=1,count do
-        local current,best=nil,math.huge
-        for i=1,count do
-            if not seen[i] and dist[i]<best then
-                current,best=i,dist[i]
-            end
-        end
-        if not current or current==2 then break end
-        seen[current]=true
-        local a=nodes[current].Root
-        for i=2,count do
-            if not seen[i] then
-                local b=nodes[i].Root
-                local step=(b-a).Magnitude
-                if step > 0.1 and step < 330 and clearSegment(a,b) then
-                    local cost=best+step
-                    if cost<dist[i] then
-                        dist[i],prev[i]=cost,current
-                    end
-                end
-            end
-        end
-    end
-    if not prev[2] or prev[2]==1 then return nil end
-    local reversed,current={},2
-    while current and current~=1 and #reversed<16 do
-        table.insert(reversed,current)
-        current=prev[current]
-    end
-    if current~=1 then return nil end
-    local result={}
-    for i=#reversed,2,-1 do
-        local node=nodes[reversed[i]]
-        if node.Surface then table.insert(result,node.Surface) end
-    end
-    if #result==0 or #result>9 then return nil end
-    return result
-end
-
+-- Intermediate trigger-volume detours are unnecessary for instant teleport.
 function P:DestinationHitsMenuZone(position, allowedZone)
     for _, entry in ipairs(self:GetMenuTriggerZones()) do
         if entry.Part ~= allowedZone and self:IsWithinMenuZone(position, entry.Part, 1.5) then
@@ -941,47 +774,7 @@ function P:InstallShopPopupGuard()
     end)
 end
 
--- If a roof obstructs a vertical ascent while we already occupy a shop
--- trigger, try escaping by the nearest clear horizontal edge before climbing.
--- This is the only non-destination transit allowed inside that zone.
-function P:ExitOccupiedMenuZone(token)
-    local _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root then return false end
-    for _, entry in ipairs(self:GetMenuTriggerZones()) do
-        local zone = entry.Part
-        if self:IsWithinMenuZone(root.Position, zone, 0) then
-            local q = zone.CFrame:PointToObjectSpace(root.Position)
-            local half = zone.Size * 0.5
-            local margin = 11
-            local sx = q.X >= 0 and 1 or -1
-            local sz = q.Z >= 0 and 1 or -1
-            local candidates = {
-                Vector3.new(sx * (half.X + margin), q.Y, q.Z),
-                Vector3.new(q.X, q.Y, sz * (half.Z + margin)),
-                Vector3.new(-sx * (half.X + margin), q.Y, q.Z),
-                Vector3.new(q.X, q.Y, -sz * (half.Z + margin)),
-            }
-            table.sort(candidates, function(a, b)
-                return (a - q).Magnitude < (b - q).Magnitude
-            end)
-            for _, localGoal in ipairs(candidates) do
-                local worldRoot = zone.CFrame:PointToWorldSpace(localGoal)
-                if not self:DestinationHitsMenuZone(worldRoot, zone) then
-                    local previous = self.Navigation.AllowedShopZone
-                    self.Navigation.AllowedShopZone = zone
-                    local offset = self:GetRootGroundOffset(humanoid, root)
-                    local surface = worldRoot - Vector3.new(0, offset, 0)
-                    local ok = self:TweenWaypoint(surface,
-                        Enum.PathWaypointAction.Walk, token, 2.5, nil, nil, 130)
-                    self.Navigation.AllowedShopZone = previous
-                    if ok then return true end
-                end
-            end
-        end
-    end
-    return false
-end
-
+-- Old sky/roof escape removed: direct teleport never crosses intermediate shops.
 -- Route through the open middle of the four shop stalls, aligned to spawn
 -- and toward Stage 1. No guessed world coordinates or shop-edge ascents.
 function P:GetSpawnShopCorridor()
@@ -1058,738 +851,168 @@ function P:GetSpawnShopCorridor()
 end
 
 -- Sky travel removed in v1.8.0. Ground waypoints and shop avoidance remain.
-function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
-    if typeof(fromSurface) ~= "Vector3" or typeof(toSurface) ~= "Vector3" then
-        return false
+-- Zone height is resolved using the destination zone (never the player's
+-- current elevated platform). This prevents high-stage travel from picking
+-- an accidental rooftop instead of the spawn/shop floor.
+function P:GetTeleportSurface(goal,zone)
+    if not zone or not zone:IsA("BasePart") then
+        return self:ProjectToGround(goal)
     end
+    local ch=self.Player.Character
+    local exclusions={zone}
+    if ch then table.insert(exclusions,ch) end
+    local rp=RaycastParams.new()
+    rp.FilterType=Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances=exclusions
+    pcall(function() rp.RespectCanCollide=true end)
+    local top=zone.Position.Y+zone.Size.Y*0.5
+    local bottom=zone.Position.Y-zone.Size.Y*0.5
+    local origin=Vector3.new(goal.X,top+10,goal.Z)
+    local hit=workspace:Raycast(origin,Vector3.new(0,-110,0),rp)
+    local y=bottom
+    if hit and hit.Position.Y<=top+0.75 and hit.Position.Y>=bottom-12 then
+        y=hit.Position.Y
+    end
+    return Vector3.new(goal.X,y,goal.Z)
+end
 
-    local character, humanoid, root = self:GetCharacter()
-    if not root or not humanoid then
-        return false
+function P:IsSafeTPLanding(pos,options)
+    if options.Zone and not self:IsPointInsidePart(options.Zone,pos,0.1) then
+        return false,"outside target zone"
     end
-
-    local exclude = {}
-    if character then
-        table.insert(exclude, character)
-    end
-    if typeof(extraExclude) == "Instance" then
-        table.insert(exclude, extraExclude)
-    elseif type(extraExclude) == "table" then
-        for _, item in ipairs(extraExclude) do
-            if typeof(item) == "Instance" then
-                table.insert(exclude, item)
-            end
+    local bad,entry=self:DestinationHitsMenuZone(pos,options.AllowedShopZone)
+    if bad then return false,"unrelated menu trigger: "..tostring(entry.Menu) end
+    local ch=self.Player.Character
+    if not ch then return false,"character missing" end
+    local params=OverlapParams.new()
+    params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances={ch}
+    params.MaxParts=80
+    local ok,parts=pcall(function()
+        return workspace:GetPartBoundsInBox(CFrame.new(pos+Vector3.new(0,0.35,0)),
+            Vector3.new(1.9,2.5,1.9),params)
+    end)
+    if not ok then return false,"collision query failed" end
+    for _,part in ipairs(parts) do
+        if part.CanCollide and part~=options.Zone and part~=options.Exclude then
+            return false,"occupied: "..part.Name
         end
     end
+    return true
+end
 
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = exclude
-    params.IgnoreWater = false
-    pcall(function()
-        params.RespectCanCollide = true
-    end)
-
-    local fromRoot = root.Position
-    local toRoot = self:GetTweenRootTarget(toSurface, humanoid, root)
-    if not toRoot then
-        return false
-    end
-
-    -- Check both around the torso/root and lower body. This keeps the tween from
-    -- taking a visual shortcut through rocks, walls, railings, or shop props.
-    local delta = toRoot - fromRoot
-    if delta.Magnitude <= 0.2 then
+function P:WalkToPosition(goalPosition,options)
+    options=options or {}
+    if typeof(goalPosition)~="Vector3" then return false end
+    local character,humanoid,root=self:GetCharacter()
+    if not root or not humanoid or humanoid.Health<=0 then return false end
+    local predicate=options.ArrivalPredicate
+    if type(predicate)=="function" and self:WalkArrivalSatisfied(predicate) then
         return true
     end
-
-    local upperHit = workspace:Raycast(fromRoot, delta, params)
-    if upperHit then
-        return false
+    local surface=self:GetTeleportSurface(goalPosition,options.Zone)
+    if not surface then return false end
+    local target=self:GetTeleportRootTarget(surface,humanoid,root)
+    if not target then return false end
+    if type(predicate)~="function"
+        and (root.Position-target).Magnitude<=(tonumber(options.AcceptanceRadius) or 2.75) then
+        return true
     end
-
-    local lowerOffset = Vector3.new(0, -math.min(1.25, self:GetRootGroundOffset(humanoid, root) * 0.45), 0)
-    local lowerHit = workspace:Raycast(fromRoot + lowerOffset, delta, params)
-    return lowerHit == nil
-end
-
-function P:TweenWaypoint(surfacePosition, action, token, acceptance, arrivalPredicate, blockedPredicate, speedLimit)
-    -- Movement/collision isolation belongs to the *whole route*, not to each
-    -- waypoint. The route finisher, StopWalking, respawn, and Unload release it.
-    local function waypointResult(result, reason)
-        return result, reason
-    end
-    local _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root or humanoid.Health <= 0 then
-        return waypointResult(false, "character")
-    end
-    if typeof(surfacePosition) ~= "Vector3" then
-        return waypointResult(false, "goal")
-    end
-
-    local authoritativeArrival = type(arrivalPredicate) == "function"
-    if authoritativeArrival and self:WalkArrivalSatisfied(arrivalPredicate) then
-        return waypointResult(true, "arrived")
-    end
-
-    local targetPosition = self:GetTweenRootTarget(surfacePosition, humanoid, root)
-    if not targetPosition then
-        return waypointResult(false, "goal")
-    end
-
-    local distance = (root.Position - targetPosition).Magnitude
-    if not authoritativeArrival and distance <= (acceptance or 2.5) then
-        return waypointResult(true, "arrived")
-    end
-
-    if type(blockedPredicate) == "function" then
-        local ok, blocked = pcall(blockedPredicate)
-        if ok and blocked then
-            return waypointResult(false, "blocked")
-        end
-    end
-
-    humanoid.Sit = false
-    humanoid.AutoRotate = false
-    pcall(function()
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end)
-
-    -- Keep the avatar upright and rotate smoothly toward the direction of travel.
-    local flatDirection = Vector3.new(
-        targetPosition.X - root.Position.X,
-        0,
-        targetPosition.Z - root.Position.Z
-    )
-
-    local targetCFrame
-    if flatDirection.Magnitude > 0.05 then
-        local facing = flatDirection.Unit
-        targetCFrame = CFrame.lookAt(
-            targetPosition,
-            targetPosition + Vector3.new(facing.X, 0, facing.Z),
-            Vector3.yAxis
-        )
-    else
-        local look = root.CFrame.LookVector
-        local flatLook = Vector3.new(look.X, 0, look.Z)
-        if flatLook.Magnitude < 0.05 then
-            flatLook = Vector3.new(0, 0, -1)
-        else
-            flatLook = flatLook.Unit
-        end
-        targetCFrame = CFrame.lookAt(targetPosition, targetPosition + flatLook, Vector3.yAxis)
-    end
-
-    -- Keep velocity continuous across adjacent waypoints: one constant rate,
-    -- smooth CFrame rotation, no easing slowdown at every turn.
-    local speed = math.clamp(tonumber(self.Settings.TweenSpeed) or 600, 20, 750)
-    if tonumber(speedLimit) then speed = math.min(speed, tonumber(speedLimit)) end
-    local duration = math.max(0.04, distance / speed)
-
-    -- Jump waypoints get a shallow two-part arc instead of snapping vertically.
-    if action == Enum.PathWaypointAction.Jump and distance > 2.5 then
-        local midpoint = (root.Position + targetPosition) * 0.5 + Vector3.new(0, 2.2, 0)
-        local firstSurface = Vector3.new(
-            midpoint.X,
-            midpoint.Y - self:GetRootGroundOffset(humanoid, root),
-            midpoint.Z
-        )
-        local ok, reason = self:TweenWaypoint(
-            firstSurface,
-            Enum.PathWaypointAction.Walk,
-            token,
-            1.0,
-            nil,
-            blockedPredicate
-        )
-        if not ok then
-            return false, reason
-        end
-        _, humanoid, root = self:GetCharacter()
-        if not humanoid or not root or humanoid.Health <= 0 then
-            return waypointResult(false, "character")
-        end
-        targetPosition = self:GetTweenRootTarget(surfacePosition, humanoid, root)
-        distance = (root.Position - targetPosition).Magnitude
-        duration = math.max(0.04, distance / speed)
-        flatDirection = Vector3.new(
-            targetPosition.X - root.Position.X,
-            0,
-            targetPosition.Z - root.Position.Z
-        )
-        if flatDirection.Magnitude > 0.05 then
-            targetCFrame = CFrame.lookAt(targetPosition, targetPosition + flatDirection.Unit, Vector3.yAxis)
-        else
-            targetCFrame = CFrame.new(targetPosition) * root.CFrame.Rotation
-        end
-    end
-
-    -- Prevent a clear *physical* path from clipping invisible ZoneOpener parts.
-    -- A vertical escape from a shop occupied before movement is the only
-    -- exception; its destination must be above that shop's trigger volume.
-    local avoid, menu = self:RouteCrossesMenuZone(
-        root.Position, targetPosition, self.Navigation.AllowedShopZone, 5
-    )
-    if avoid then
-        local verticalEscape = self.Navigation.SkyAscent
-            and math.abs(root.Position.X - targetPosition.X) < 1.5
-            and math.abs(root.Position.Z - targetPosition.Z) < 1.5
-            and targetPosition.Y > root.Position.Y + 4
-            and self:IsWithinMenuZone(root.Position, menu.Part, 6)
-        if not verticalEscape then
-            return waypointResult(false, "protected shop/menu zone: " .. tostring(menu.Menu))
-        end
-    end
-
-    -- Re-check collision-free line immediately before moving along each path segment.
-    -- Never silently fly through a blocking rock or wall.
-    local tweenSurface = targetPosition - Vector3.new(0, self:GetRootGroundOffset(humanoid, root), 0)
-    if not self:IsTweenLineClear(root.Position, tweenSurface) then
-        return waypointResult(false, "obstacle")
-    end
-    if not self:BeginTweenBody(token, humanoid, root) then
-        return waypointResult(false, "character")
-    end
-
-    local tween = self.S.TweenService:Create(
-        root,
-        TweenInfo.new(
-            duration,
-            Enum.EasingStyle.Linear,
-            Enum.EasingDirection.InOut,
-            0,
-            false,
-            0
-        ),
-        {CFrame = targetCFrame}
-    )
-
-    self.Navigation.ActiveTween = tween
-    local completed = false
-    local playbackState = nil
-    local completedConnection = tween.Completed:Connect(function(state)
-        completed = true
-        playbackState = state
-    end)
-
-    tween:Play()
-    local started = os.clock()
-    local lastObservedPos = root.Position
-    local lastObservedAt = started
-    local timeout = duration + math.max(1.25, duration * 0.40)
-
-    while self:IsWalkTokenActive(token) and not completed do
-        _, humanoid, root = self:GetCharacter()
-        if not humanoid or not root or humanoid.Health <= 0 then
-            pcall(function() tween:Cancel() end)
-            pcall(function() completedConnection:Disconnect() end)
-            return waypointResult(false, "character")
-        end
-
-        if authoritativeArrival and self:WalkArrivalSatisfied(arrivalPredicate) then
-            pcall(function() tween:Cancel() end)
-            pcall(function() completedConnection:Disconnect() end)
-            if self.Navigation.ActiveTween == tween then
-                self.Navigation.ActiveTween = nil
-            end
-            return waypointResult(true, "arrived")
-        end
-
-        if type(blockedPredicate) == "function" then
-            local ok, blocked = pcall(blockedPredicate)
-            if ok and blocked then
-                pcall(function() tween:Cancel() end)
-                pcall(function() completedConnection:Disconnect() end)
-                if self.Navigation.ActiveTween == tween then
-                    self.Navigation.ActiveTween = nil
-                end
-                return waypointResult(false, "blocked")
+    self.Navigation.Token=(self.Navigation.Token or 0)+1
+    local token=self.Navigation.Token
+    self.Navigation.Busy=true
+    self.Navigation.Destination=surface
+    self.Navigation.Waypoint=0
+    self.Navigation.AllowedShopZone=options.AllowedShopZone
+    self.Navigation.LastResult="Instant TP"
+    self:DebugEvent("TP","From "..tostring(root.Position).." to "..tostring(target))
+    local function finish(success,reason)
+        self:ReleaseTeleportBody()
+        if self.Navigation.Token==token then
+            self.Navigation.Busy=false
+            self.Navigation.Destination=nil
+            self.Navigation.AllowedShopZone=nil
+            self.Navigation.LastResult=reason or (success and "TP arrived" or "TP failed")
+            if not success then
+                self.Debug.LastRouteIssue=self.Navigation.LastResult
+                self:DebugEvent("FAIL",self.Debug.LastRouteIssue)
+            else
+                self:DebugEvent("TP",self.Navigation.LastResult)
             end
         end
-
-        -- Server-side teleports/rubber-banding must cancel this route instead of
-        -- continuing from a corrected position through a shop trigger.
-        local tickNow = os.clock()
-        local stepSeconds = math.max(0.016, tickNow - lastObservedAt)
-        local displacement = (root.Position - lastObservedPos).Magnitude
-        if displacement > math.max(38, speed * stepSeconds * 2 + 18) then
-            pcall(function() tween:Cancel() end)
-            pcall(function() completedConnection:Disconnect() end)
-            if self.Navigation.ActiveTween == tween then self.Navigation.ActiveTween = nil end
-            return waypointResult(false, "server repositioned character")
-        end
-        lastObservedPos = root.Position
-        lastObservedAt = tickNow
-        self.Navigation.LastDistance = (root.Position - targetPosition).Magnitude
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end)
-        if os.clock() - started > timeout then
-            pcall(function() tween:Cancel() end)
-            pcall(function() completedConnection:Disconnect() end)
-            if self.Navigation.ActiveTween == tween then
-                self.Navigation.ActiveTween = nil
-            end
-            return waypointResult(false, "timeout")
-        end
-        task.wait(0.016) -- fine-grained arrival/blocked checks at high speed
+        return success
     end
-
-    pcall(function() completedConnection:Disconnect() end)
-    if self.Navigation.ActiveTween == tween then
-        self.Navigation.ActiveTween = nil
-    end
-
-    if not self:IsWalkTokenActive(token) then
-        pcall(function() tween:Cancel() end)
-        return waypointResult(false, "cancelled")
-    end
-
-    _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root or humanoid.Health <= 0 then
-        return waypointResult(false, "character")
-    end
-
-    if authoritativeArrival then
-        if self:WalkArrivalSatisfied(arrivalPredicate) then
-            return waypointResult(true, "arrived")
-        end
-    elseif (root.Position - targetPosition).Magnitude <= (acceptance or 2.5) + 0.75 then
-        return waypointResult(true, "arrived")
-    end
-
-    if playbackState == Enum.PlaybackState.Completed then
-        -- Server correction can leave the root a little short. Treat a very small
-        -- discrepancy as complete; larger corrections trigger a clean repath.
-        local residual = (root.Position - targetPosition).Magnitude
-        if not authoritativeArrival and residual <= math.max(1.5, acceptance or 2.5) then
-            return waypointResult(true, "arrived")
-        end
-    end
-
-    return waypointResult(false, "corrected")
-end
-
--- Only rock stages occupy disconnected vertical platform levels. This
--- transition never runs for shops, plots, treasure pickup or normal travel.
--- Stage 1 -> Stage 2 is ~58 studs up, unreachable by ground PathfindingService.
-function P:TravelStageElevation(surface, token, predicate)
-    local _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root or humanoid.Health <= 0 then
-        return false, "character"
-    end
-    local goal = self:GetTweenRootTarget(surface, humanoid, root)
-    if not goal then return false, "no stage goal" end
-    if math.abs(goal.Y-root.Position.Y) < 18 then
-        return false, "not an elevation change"
-    end
-    if self:DestinationHitsMenuZone(root.Position)
-        or self:DestinationHitsMenuZone(goal) then
-        return false, "stage transition intersects shop area"
-    end
-    local offset = self:GetRootGroundOffset(humanoid, root)
-    local top = math.max(root.Position.Y, goal.Y) + 8
-    local steps = {
-        {Label = "rise", Point = Vector3.new(root.Position.X,top,root.Position.Z)},
-        {Label = "cross", Point = Vector3.new(goal.X,top,goal.Z)},
-        {Label = "land", Point = goal},
+    local offsets={
+        Vector3.zero,Vector3.new(1.5,0,0),Vector3.new(-1.5,0,0),
+        Vector3.new(0,0,1.5),Vector3.new(0,0,-1.5),
+        Vector3.new(3,0,0),Vector3.new(-3,0,0),
+        Vector3.new(0,0,3),Vector3.new(0,0,-3),
+        Vector3.new(0,1.3,0),Vector3.new(0,2.4,0),
     }
-    self:DebugEvent("STAGE",string.format(
-        "Stage platform transition: from Y %.1f to %.1f via %.1f",
-        root.Position.Y,goal.Y,top))
-    for index, step in ipairs(steps) do
-        if not self:IsWalkTokenActive(token) then return false,"cancelled" end
-        local _, h, r = self:GetCharacter()
-        if not h or not r or h.Health<=0 then return false,"character" end
-        if self:RouteCrossesMenuZone(r.Position,step.Point,nil,5) then
-            return false,"stage transition would cross shop trigger"
-        end
-        local targetSurface=step.Point-Vector3.new(0,offset,0)
-        self.Navigation.LastResult="Stage transit "..step.Label
-        local ok,reason=self:TweenWaypoint(targetSurface,
-            Enum.PathWaypointAction.Walk,token,
-            index==#steps and 2.0 or 2.5,
-            index==#steps and predicate or nil)
-        if not ok then
-            local why="stage "..step.Label.." failed: "..tostring(reason)
-            self:DebugEvent("STAGE",why)
-            return false,why
-        end
-    end
-    if type(predicate)=="function" then
-        return self:WalkArrivalSatisfied(predicate),
-            "platform reached but stage zone not entered"
-    end
-    return true,"stage level reached"
-end
-
-function P:WalkToPosition(goalPosition, options)
-    options = options or {}
-    if typeof(goalPosition) ~= "Vector3" then
-        return false
-    end
-
-    local _, humanoid, root = self:GetCharacter()
-    if not humanoid or not root or humanoid.Health <= 0 then
-        return false
-    end
-
-    local acceptance = math.max(
-        0.75,
-        tonumber(options.AcceptanceRadius)
-            or tonumber(self.Settings.WalkAcceptanceRadius)
-            or 2.75
-    )
-    local arrivalPredicate = options.ArrivalPredicate
-    local authoritativeArrival = type(arrivalPredicate) == "function"
-    local projected = options.ProjectGround == false
-        and goalPosition
-        or self:ProjectToGround(goalPosition, options.Exclude)
-    if not projected then
-        return false
-    end
-    local projectedRoot = self:GetTweenRootTarget(projected, humanoid, root)
-    if projectedRoot and self:DestinationHitsMenuZone(projectedRoot, options.AllowedShopZone) then
-        self.LastError = "Refusing route into an unrelated shop trigger"
-        return false
-    end
-
-    if authoritativeArrival then
-        if self:WalkArrivalSatisfied(arrivalPredicate) then
-            return true
-        end
-    else
-        local initialTarget = self:GetTweenRootTarget(projected, humanoid, root)
-        if initialTarget and (root.Position - initialTarget).Magnitude <= acceptance then
-            return true
-        end
-    end
-
-    -- A new destination owns the movement controller and cancels any previous tween.
-    self.Navigation.Token = (self.Navigation.Token or 0) + 1
-    local token = self.Navigation.Token
-
-    local oldTween = self.Navigation.ActiveTween
-    self.Navigation.ActiveTween = nil
-    if oldTween then
-        pcall(function() oldTween:Cancel() end)
-    end
-    self:ReleaseTweenBody() -- never carry an old route's collision state forward
-
-    self.Navigation.Destination = projected
-    self.Navigation.LastResult = "Ground tween route"
-    self.Navigation.Repaths = 0
-    self:DebugEvent("ROUTE", string.format("Begin %s -> %s | shop=%s",
-        tostring(root.Position), tostring(projected),
-        tostring(options.AllowedShopZone and options.AllowedShopZone:GetFullName() or "none")))
-    self.Navigation.Busy = true
-    self.Navigation.Waypoint = 0
-    self.Navigation.AllowedShopZone = options.AllowedShopZone
-    self.Navigation.SkyTravel = false
-    self.Navigation.SkyAscent = false
-
-    local originalAutoRotate = humanoid.AutoRotate
-
-    local function finish(result, text)
-        if self.Navigation.Token == token then
-            local active = self.Navigation.ActiveTween
-            self.Navigation.ActiveTween = nil
-            if active then
-                pcall(function() active:Cancel() end)
+    local attempts=0
+    local maxAttempts=math.clamp(math.floor(tonumber(options.MaxAttempts) or 4),1,8)+3
+    local last="no collision-free destination"
+    for _,delta in ipairs(offsets) do
+        if attempts>=maxAttempts then break end
+        if not self:IsWalkTokenActive(token) then return finish(false,"TP cancelled") end
+        local pos=target+delta
+        local safe,why=self:IsSafeTPLanding(pos,options)
+        if safe then
+            attempts+=1
+            character,humanoid,root=self:GetCharacter()
+            if not character or not root or not humanoid or humanoid.Health<=0 then
+                return finish(false,"character unavailable")
             end
-            self:ReleaseTweenBody(token) -- restore collisions only once, at route end
-
-            local _, finishHumanoid, finishRoot = self:GetCharacter()
-            if finishHumanoid then
-                pcall(function()
-                    finishHumanoid.AutoRotate = originalAutoRotate ~= false
-                    finishHumanoid.Sit = false
-                end)
+            if not self:BeginTeleportBody(root,humanoid) then
+                return finish(false,"cannot isolate character physics")
             end
-            if finishRoot then
-                pcall(function()
-                    finishRoot.AssemblyLinearVelocity = Vector3.zero
-                    finishRoot.AssemblyAngularVelocity = Vector3.zero
-                end)
-            end
-
-            self.Navigation.Destination = nil
-            self.Navigation.LastResult = text or (result and "Arrived" or "Failed")
-            if not result then
-                self.Debug.LastRouteIssue = tostring(self.Navigation.LastResult)
-                self:DebugEvent("FAIL", string.format("Route to %s failed: %s",
-                    tostring(projected), tostring(self.Navigation.LastResult)))
-            elseif self.Settings.DebugConsole then
-                self:DebugEvent("ARRIVE", string.format("Route complete: %s",
-                    tostring(projected)))
-            end
-            self.Navigation.Busy = false
-            self.Navigation.Waypoint = 0
-            self.Navigation.AllowedShopZone = nil
-            self.Navigation.SkyTravel = false
-            self.Navigation.SkyAscent = false
-        end
-        return result
-    end
-
-    local maxAttempts = math.clamp(
-        math.floor(tonumber(options.MaxAttempts) or tonumber(self.Settings.PathRetries) or 4),
-        1,
-        8
-    )
-
-    -- A stage-only vertical change is essential for floating rock platforms.
-    -- Shop movement and all ordinary routes remain ground/pathfinding-only.
-    if options.StageElevation == true and projectedRoot
-        and math.abs(projectedRoot.Y-root.Position.Y) >= 18 then
-        local ok, reason=self:TravelStageElevation(projected,token,arrivalPredicate)
-        if ok then return finish(true,"Reached elevated rock platform") end
-        self.Debug.LastRouteIssue=tostring(reason)
-        return finish(false,"Stage level route: "..tostring(reason))
-    end
-
-    -- Ground only for shop zones, plots and same-height waypoints.
-    for attempt = 1, maxAttempts do
-        if not self:IsWalkTokenActive(token) then
-            return finish(false, "Cancelled")
-        end
-
-        _, humanoid, root = self:GetCharacter()
-        if not humanoid or not root or humanoid.Health <= 0 then
-            return finish(false, "Character unavailable")
-        end
-
-        if authoritativeArrival then
-            if self:WalkArrivalSatisfied(arrivalPredicate) then
-                return finish(true, "Arrived")
-            end
-        else
-            local target = self:GetTweenRootTarget(projected, humanoid, root)
-            if target and (root.Position - target).Magnitude <= acceptance then
-                return finish(true, "Arrived")
-            end
-        end
-
-        if options.ProjectGround ~= false then
-            projected = self:ProjectToGround(goalPosition, options.Exclude) or projected
-            self.Navigation.Destination = projected
-        end
-
-        self.Navigation.Repaths = attempt - 1
-        local projectedRoot = self:GetTweenRootTarget(projected, humanoid, root)
-        local distance = projectedRoot and (root.Position - projectedRoot).Magnitude or 0
-        -- Route around invisible menu triggers before asking the pathfinder to
-        -- cross them again. Only real ground waypoints; absolutely no sky route.
-        if projectedRoot and attempt <= 3 then
-            local detour = self:FindGroundMenuDetour(
-                root.Position, projectedRoot, options.AllowedShopZone)
-            if detour then
-                self:DebugEvent("DETOUR", string.format(
-                    "Walking around protected shop triggers via %d ground waypoint(s)",
-                    #detour))
-                local progressed = false
-                for index, surface in ipairs(detour) do
-                    if not self:IsWalkTokenActive(token) then
-                        return finish(false, "Cancelled during shop detour")
-                    end
-                    self.Navigation.Waypoint = index
-                    local ok, reason = self:TweenWaypoint(surface,
-                        Enum.PathWaypointAction.Walk, token, 2.5)
-                    if not ok then
-                        self.Debug.LastRouteIssue = "Detour waypoint "..
-                            index..": "..tostring(reason)
-                        self:DebugEvent("DETOUR", self.Debug.LastRouteIssue)
-                        break
-                    end
-                    progressed = true
-                end
-                if progressed then
-                    -- Replan from the new safe side of the shop cluster.
-                    continue
-                end
-            end
-        end
-        -- Ground-only pathfinding, including all travel to stages and shops.
-        self.Navigation.LastResult = attempt == 1
-            and "Planning tween route"
-            or ("Tween repath " .. tostring(attempt - 1))
-
-        local agentRadius = math.clamp(math.max(root.Size.X, root.Size.Z) * 0.5, 1.25, 2.5)
-        local agentHeight = math.clamp(
-            root.Size.Y + (tonumber(humanoid.HipHeight) or 2) * 2,
-            4,
-            8
-        )
-        local waypointSpacing = math.clamp(
-            tonumber(self.Settings.TweenWaypointSpacing) or 9,
-            3,
-            12
-        )
-
-        local path = self.S.PathfindingService:CreatePath({
-            AgentRadius = agentRadius,
-            AgentHeight = agentHeight,
-            AgentCanJump = true,
-            AgentCanClimb = true,
-            WaypointSpacing = waypointSpacing,
-        })
-
-        local computed = pcall(function()
-            path:ComputeAsync(root.Position, projected)
-        end)
-
-        local moved = false
-        local failureReason = "path"
-        local blocked = false
-        local blockedWaypoint = math.huge
-        local currentWaypoint = 1
-        local blockedConnection
-
-        if computed and path.Status == Enum.PathStatus.Success then
-            blockedConnection = path.Blocked:Connect(function(index)
-                blockedWaypoint = math.min(blockedWaypoint, tonumber(index) or math.huge)
-                if blockedWaypoint >= currentWaypoint then
-                    blocked = true
-                end
+            local forward=root.CFrame.LookVector
+            local flat=Vector3.new(forward.X,0,forward.Z)
+            flat=flat.Magnitude>0.05 and flat.Unit or Vector3.new(0,0,-1)
+            local cf=CFrame.lookAt(pos,pos+flat,Vector3.yAxis)
+            -- Anchor ONLY for the atomic PivotTo; unanchor before yielding
+            -- so the next frame is network-owned and can register zone entry.
+            local ok,err=pcall(function()
+                root.Anchored=true
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.AssemblyAngularVelocity=Vector3.zero
+                character:PivotTo(cf)
+                root.Anchored=false
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.AssemblyAngularVelocity=Vector3.zero
             end)
-
-            local waypoints = path:GetWaypoints()
-            moved = #waypoints > 0
-
-            if #waypoints <= 1 then
-                local ok, reason = self:TweenWaypoint(
-                    projected,
-                    Enum.PathWaypointAction.Walk,
-                    token,
-                    acceptance,
-                    arrivalPredicate,
-                    function() return blocked end
-                )
-                moved = ok
-                failureReason = reason
+            if not ok then
+                last="PivotTo failed: "..tostring(err)
+                self:ReleaseTeleportBody()
             else
-                -- String-pull the computed path into the longest physically
-                -- clear segments. This removes dozens of tiny start/stop tweens
-                -- without cutting through walls or skipping jump waypoints.
-                local index = 2
-                while index <= #waypoints do
-                    local destinationIndex = index
-                    local nextAction = waypoints[index].Action
-                    if nextAction ~= Enum.PathWaypointAction.Jump then
-                        local upper = math.min(#waypoints, index + 14)
-                        local jumpBetween = false
-                        for candidate = index + 1, upper do
-                            if waypoints[candidate].Action == Enum.PathWaypointAction.Jump then
-                                jumpBetween = true
-                            end
-                            if jumpBetween then
-                                break
-                            end
-                            local _, _, currentRoot = self:GetCharacter()
-                            if currentRoot and self:IsTweenLineClear(
-                                currentRoot.Position,
-                                waypoints[candidate].Position,
-                                options.Exclude
-                            ) then
-                                destinationIndex = candidate
-                            else
-                                -- A clear segment to a later waypoint can exist even
-                                -- if an intermediate segment is obstructed, but don't
-                                -- gamble at high speeds: take the known safe prefix.
-                                break
-                            end
-                        end
+                task.wait(math.clamp(tonumber(self.Settings.TeleportSettleSeconds) or 0.12,0.06,0.3))
+                pcall(function()
+                    root.AssemblyLinearVelocity=Vector3.zero
+                    root.AssemblyAngularVelocity=Vector3.zero
+                end)
+                self:ReleaseTeleportBody()
+                local _,h,r=self:GetCharacter()
+                if not h or not r or h.Health<=0 then return finish(false,"character changed") end
+                if (r.Position-pos).Magnitude>9 then
+                    last="server position correction"
+                elseif type(predicate)=="function" then
+                    if self:WalkArrivalSatisfied(predicate) then
+                        return finish(true,"Teleport entered zone")
                     end
-
-                    currentWaypoint = destinationIndex
-                    self.Navigation.Waypoint = destinationIndex
-                    if blocked and blockedWaypoint <= destinationIndex then
-                        moved = false
-                        failureReason = "blocked"
-                        break
+                    task.wait(0.10)
+                    if self:WalkArrivalSatisfied(predicate) then
+                        return finish(true,"Teleport entered zone")
                     end
-
-                    local waypoint = waypoints[destinationIndex]
-                    local finalWaypoint = destinationIndex == #waypoints
-                    self.Navigation.LastResult = string.format(
-                        "Fast smooth tween • point %d/%d",
-                        destinationIndex - 1,
-                        #waypoints - 1
-                    )
-
-                    local ok, reason = self:TweenWaypoint(
-                        waypoint.Position,
-                        waypoint.Action,
-                        token,
-                        finalWaypoint and acceptance or 1.25,
-                        finalWaypoint and arrivalPredicate or nil,
-                        function()
-                            return blocked and blockedWaypoint <= currentWaypoint
-                        end
-                    )
-                    if not ok then
-                        moved = false
-                        failureReason = reason
-                        break
-                    end
-                    index = destinationIndex + 1
+                    last="zone entry not confirmed"
+                else
+                    return finish(true,"Safe TP completed")
                 end
             end
         else
-            -- Only use a direct fallback when there is a clear physical line.
-            -- This prevents a pathfinding failure from turning into wall clipping.
-            local clear = self:IsTweenLineClear(root.Position, projected, options.Exclude)
-            if clear then
-                local ok, reason = self:TweenWaypoint(
-                    projected,
-                    Enum.PathWaypointAction.Walk,
-                    token,
-                    acceptance,
-                    arrivalPredicate,
-                    nil
-                )
-                moved = ok
-                failureReason = reason
-            else
-                moved = false
-                failureReason = "no safe route"
-            end
+            last=tostring(why)
         end
-
-        if blockedConnection then
-            pcall(function() blockedConnection:Disconnect() end)
-        end
-
-        if moved then
-            if authoritativeArrival then
-                if self:WalkArrivalSatisfied(arrivalPredicate) then
-                    return finish(true, "Arrived")
-                end
-            else
-                _, humanoid, root = self:GetCharacter()
-                local target = root and humanoid and self:GetTweenRootTarget(projected, humanoid, root)
-                if target and (root.Position - target).Magnitude <= acceptance + 0.75 then
-                    return finish(true, "Arrived")
-                end
-            end
-        end
-
-        if not self:IsWalkTokenActive(token) then
-            return finish(false, "Cancelled")
-        end
-
-        self.Navigation.LastResult = tostring(failureReason) .. " • repathing"
-        self.Debug.LastRouteIssue = string.format(
-            "Attempt %d/%d: %s, destination=%s",
-            attempt, maxAttempts, tostring(failureReason), tostring(projected))
-        self:DebugEvent("REPATH", self.Debug.LastRouteIssue)
-        task.wait(0.12 + math.min(0.28, attempt * 0.04))
     end
-
-    return finish(false, self.Debug.LastRouteIssue or "Ground tween route failed")
+    return finish(false,"Safe TP failed: "..last)
 end
 
 function P:WalkToObject(object, acceptance)
@@ -1884,7 +1107,7 @@ function P:WalkIntoZone(zone, intentionalShop)
             local floor=self:ProjectToGround(world,zone)
             if floor then
                 local _, h, r=self:GetCharacter()
-                local dest=h and r and self:GetTweenRootTarget(floor,h,r)
+                local dest=h and r and self:GetTeleportRootTarget(floor,h,r)
                 if dest and not self:DestinationHitsMenuZone(dest,zone) then
                     table.insert(candidates,floor)
                 end
@@ -1902,10 +1125,7 @@ function P:WalkIntoZone(zone, intentionalShop)
             AcceptanceRadius = 1.15,
             Exclude = zone,
             AllowedShopZone = intentionalShop and zone or nil,
-            StageElevation = not intentionalShop
-                and zone.Name == "LiftZone"
-                and zone.Parent and zone.Parent:IsA("Model")
-                and tonumber(zone.Parent:GetAttribute("StageId")) ~= nil,
+            Zone = zone,
             MaxAttempts = intentionalShop and 2 or (index == 1 and 4 or 2),
             ArrivalPredicate = inside,
         })
@@ -2079,7 +1299,7 @@ function P:GetSafeSpawnBankPoint(zone)
         if self:IsPointInsidePart(zone,location,1.5) then
             local floor = self:ProjectToGround(location,zone)
             local _,h,r = self:GetCharacter()
-            local goal = floor and h and r and self:GetTweenRootTarget(floor,h,r)
+            local goal = floor and h and r and self:GetTeleportRootTarget(floor,h,r)
             if goal and not self:DestinationHitsMenuZone(goal) then
                 return floor
             end
@@ -2101,31 +1321,11 @@ function P:MoveToSpawn()
         return r and self:IsPointInsidePart(zone,r.Position,0.3)==true
     end
     if inside() then return true end
-    -- From high rock stages, descend to Stage 1 on the STAGE side before
-    -- routing through the shops at ground level. No shop rooftop flying.
-    local _, h, r = self:GetCharacter()
-    local firstStage=self:GetStage(1)
-    local firstZone=firstStage and firstStage:FindFirstChild("LiftZone")
-    if h and r and firstZone and firstZone:IsA("BasePart") then
-        local ground=self:ProjectToGround(firstZone.Position,firstZone)
-        local target=ground and self:GetTweenRootTarget(ground,h,r)
-        if target and r.Position.Y>target.Y+18 then
-            self:SetStatus("Descending onto Stage 1 before banking...","MOVE")
-            self:DebugEvent("STAGE","Return: descend on Stage 1 side, not shop roofs")
-            if not self:WalkToPosition(ground,{
-                StageElevation=true,Exclude=firstZone,MaxAttempts=2,
-                AcceptanceRadius=3,
-            }) then
-                self.LastError="Could not descend to Stage 1 for bank"
-                self:DebugEvent("FAIL",self.LastError)
-                return false
-            end
-        end
-    end
+    -- Direct TP to the banking zone from any stage: no sky descent or path.
     local bankPoint=self:GetSafeSpawnBankPoint(zone)
     if bankPoint then
         local ok=self:WalkToPosition(bankPoint,{
-            AcceptanceRadius=1.5,Exclude=zone,
+            AcceptanceRadius=1.5,Exclude=zone,Zone=zone,
             ArrivalPredicate=inside,MaxAttempts=4,
         })
         if ok and inside() then
@@ -2738,7 +1938,7 @@ function P:LiftStage(stageId)
 
     local weight = self:GetStageWeight(stageId)
     local estimated = weight / math.max(1, self:CurrentPower())
-    -- Moving between rocks now takes real tween travel time, not an instant teleport.
+    -- Instant teleport between rock platforms; server stage entry is still verified.
     local deadline = os.clock() + math.clamp(estimated * 2.15 + 22, 30, 150)
     local retries = 0
     local failedEntries = 0
@@ -3223,7 +2423,7 @@ function P:ExitSpawnForBankRetry(zone)
         for _, offset in ipairs(exits) do
             local raw=r.Position+Vector3.new(offset.X,0,offset.Z)
             local ground=self:ProjectToGround(raw,zone)
-            local goal=ground and self:GetTweenRootTarget(ground,h,r)
+            local goal=ground and self:GetTeleportRootTarget(ground,h,r)
             if goal and not self:IsPointInsidePart(zone,goal,0)
                 and not self:DestinationHitsMenuZone(goal)
                 and not self:RouteCrossesMenuZone(r.Position,goal,nil,4) then
@@ -3315,83 +2515,28 @@ end
 -- A failed shop visit is temporarily backed off so selling cannot freeze
 -- all rebirth/stage progression in a loop.
 function P:GoToShopZone(shopName)
-    local now = os.clock()
-    local nextTry = self.ShopRetryAfter[shopName] or 0
-    if now < nextTry then
-        self:SetStatus(string.format("Waiting %.0fs before retrying %s shop",
-            nextTry - now, tostring(shopName)), "RECOVER")
-        return false
-    end
-    local map = self:Map()
-    local shops = map and map:FindFirstChild("Shops")
-    local shop = shops and shops:FindFirstChild(shopName)
-    local zone = shop and shop:FindFirstChild("Zone", true)
+    local now=os.clock()
+    if now<(self.ShopRetryAfter[shopName] or 0) then return false end
+    local map=self:Map()
+    local shops=map and map:FindFirstChild("Shops")
+    local shop=shops and shops:FindFirstChild(shopName)
+    local zone=shop and shop:FindFirstChild("Zone",true)
     if not zone or not zone:IsA("BasePart") then
-        self.LastError = "Missing shop trigger: "..tostring(shopName)
-        self.ShopRetryAfter[shopName] = now + 12
-        self:DebugEvent("FAIL", self.LastError)
+        self.LastError="Missing shop zone "..tostring(shopName)
+        self.ShopRetryAfter[shopName]=now+5
         return false
     end
-    local function inside()
-        local character = self.Player.Character
-        local root = character and character:FindFirstChild("HumanoidRootPart")
-        return root and self:IsPointInsidePart(zone, root.Position, 0.08)
-    end
-    self:SetStatus("Moving to "..tostring(shopName).." shop on ground...", "MOVE")
-    self:DebugEvent("SHOP", string.format("%s start, trigger=%s size=%s",
-        tostring(shopName), tostring(zone.Position), tostring(zone.Size)))
-    if inside() then return true end
-
-    local corridor = self:GetSpawnShopCorridor()
-    local character = self.Player.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    if corridor and root then
-        local side = (root.Position - corridor.Lane):Dot(corridor.Forward)
-        local startAlong = side > corridor.Max
-            and corridor.Max + 16 or corridor.Min - 16
-        local shopAlong = (zone.Position - corridor.Lane):Dot(corridor.Forward)
-        local stages = {
-            corridor.Lane + corridor.Forward * startAlong,
-            corridor.Lane + corridor.Forward * shopAlong,
-        }
-        for i, point in ipairs(stages) do
-            if inside() then return true end
-            local floor = self:ProjectToGround(point)
-            local _, h, r = self:GetCharacter()
-            local rootGoal = floor and h and r
-                and self:GetTweenRootTarget(floor, h, r)
-            if rootGoal and not self:DestinationHitsMenuZone(rootGoal, zone)
-                and (r.Position - rootGoal).Magnitude > 3 then
-                self:DebugEvent("SHOP", string.format(
-                    "%s center aisle waypoint %d at %s",
-                    tostring(shopName), i, tostring(floor)))
-                local ok = self:WalkToPosition(floor, {
-                    AcceptanceRadius = 2.5, MaxAttempts = 2,
-                })
-                if not ok then
-                    self:DebugEvent("SHOP", "Aisle waypoint "..i..
-                        " failed ("..tostring(self.Debug.LastRouteIssue).."); trying shop entry")
-                    break
-                end
-            end
-        end
-    end
-
-    local reached = self:WalkIntoZone(zone, true)
-    if reached and inside() then
-        self.ShopRetryAfter[shopName] = nil
-        self.Debug.LastRouteIssue = ""
-        self:DebugEvent("SHOP", tostring(shopName).." trigger entered successfully")
-        task.wait(0.08)
+    self:SetStatus("Teleporting to "..shopName.." shop...","MOVE")
+    local reached=self:WalkIntoZone(zone,true)
+    if reached then
+        self.ShopRetryAfter[shopName]=nil
+        self:DebugEvent("SHOP",shopName.." trigger reached via safe TP")
         self:DismissBlockingShopMenus()
         return true
     end
-
-    self.ShopRetryAfter[shopName] = os.clock() + 12
-    self.LastError = string.format("%s shop unreachable: %s",
-        tostring(shopName), tostring(self.Debug.LastRouteIssue or "zone entry failed"))
-    self:DebugEvent("FAIL", self.LastError)
-    self:SetStatus("Shop route failed; continuing farming (retry in 12s)", "RECOVER")
+    self.LastError="Cannot TP to "..shopName..": "..tostring(self.Debug.LastRouteIssue)
+    self.ShopRetryAfter[shopName]=os.clock()+5
+    self:DebugEvent("FAIL",self.LastError)
     return false
 end
 
@@ -4406,24 +3551,13 @@ function P:CreateUI()
             .. "Set Any for the mandatory tutorial pickup.",
         Height = 68,
     })
-    farm:CreateSection("Farming Speed")
-    farm:CreateSlider({
-        Name = "Smooth Tween Speed",
-        Range = {20, 750},
-        Increment = 10,
-        CurrentValue = self.Settings.TweenSpeed,
-        Suffix = " studs/s",
-        -- New unique config identity: never autoload an old Settings.TweenSpeed
-        -- profile entry, including stale speeds from v1.7.2/v1.7.3.
-        Flag = "LiftRock.FarmingTweenSpeedV174",
-        ConfigKey = "FarmingTweenSpeedV174",
-        Callback = function(value)
-            -- PuckUI sliders send a number. Keep strict bounds for corrupted files.
-            if type(value) == "table" then value = value[1] end
-            local n = tonumber(value)
-            if n then self.Settings.TweenSpeed = math.clamp(n, 20, 750) end
-        end,
+    farm:CreateParagraph({
+        Title = "Instant Safe TP",
+        Content = "Direct teleports to zones and stages (no tween or speed slider). "
+            .. "Collision checks, velocity resets and physics restoration prevent most flinging.",
+        Height = 64,
     })
+
     bindSlider(farm, "Training Speed", "TapRate", {5, 29}, 1, "/s")
 
     local upgrades = window:CreateTab("Upgrades")
