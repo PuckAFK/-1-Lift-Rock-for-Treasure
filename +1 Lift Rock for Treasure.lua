@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.8 - Center-Spawn Shop Sky Corridor
+    Smart AutoFarm v1.7.9 - Return-to-Spawn + Bank Loop Fix
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.8",
+    Version = "1.7.9",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -1004,8 +1004,10 @@ function P:GetSpawnShopCorridorPlan(fromRoot, toRoot, allowedZone)
         and endAlong > route.Min-95 and startAlong > endAlong+14
     if not outbound and not inbound then return nil end
     route.TakeoffAlong = math.clamp(startAlong, route.Min-18, route.Max+18)
+    -- On the return trip land OUTSIDE the stalls, never inside their trigger
+    -- footprint. Continue toward the real SpawnZone only after touchdown.
     route.LandingAlong = outbound and route.Max+14
-        or math.clamp(endAlong, route.Min-16, route.Max-4)
+        or route.Min-18
     return route
 end
 
@@ -1090,11 +1092,14 @@ function P:FlyOverMenuZones(groundDestination, token, allowedZone, acceptance, p
     self.Navigation.LastResult="Crossing sky over central walkway toward stages"
     ok,why=self:TweenWaypoint(crossing,Enum.PathWaypointAction.Walk,token,1.75)
     if not ok then return false,"center crossing: "..tostring(why) end
-    self.Navigation.LastResult="Landing just after shops"
+    self.Navigation.LastResult = plan.Outbound
+        and "Landing on stage side of shops"
+        or "Landing on spawn side of shops"
     ok,why=self:TweenWaypoint(landingGround,Enum.PathWaypointAction.Walk,token,2.25)
     if not ok then return false,"center descent: "..tostring(why) end
     self.Navigation.SkyTravel=false
-    return true,"spawn center shop corridor cleared"
+    -- This finishes the shop crossing, NOT the actual banking destination.
+    return true, plan.Outbound and "stage-side landing" or "spawn-side landing"
 end
 
 function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
@@ -1995,18 +2000,65 @@ function P:IsAtSpawn()
     return self:IsPointInsidePart(spawnZone, root.Position, 0)
 end
 
+-- Prefer a bank point on the open center aisle instead of the nearest shop-side
+-- edge of SpawnZone. The return path stays independent of the shop UI.
+function P:GetSafeSpawnBankPoint(zone)
+    if not zone or not zone:IsA("BasePart") then return nil end
+    local corridor = self:GetSpawnShopCorridor()
+    local goals = {}
+    if corridor then
+        local along = (zone.Position-corridor.Lane):Dot(corridor.Forward)
+        local center = corridor.Lane+corridor.Forward*along
+        for _, offset in ipairs({0,-4,4,-8,8,-12,12}) do
+            table.insert(goals, center+corridor.Forward*offset)
+        end
+    end
+    table.insert(goals,zone.Position)
+    for _, candidate in ipairs(goals) do
+        local location = Vector3.new(candidate.X,zone.Position.Y,candidate.Z)
+        if self:IsPointInsidePart(zone,location,1.5) then
+            local floor = self:ProjectToGround(location,zone)
+            local _,h,r = self:GetCharacter()
+            local goal = floor and h and r and self:GetTweenRootTarget(floor,h,r)
+            if goal and not self:DestinationHitsMenuZone(goal) then
+                return floor
+            end
+        end
+    end
+    return nil
+end
+
 function P:MoveToSpawn()
-    local map = self:Map()
-    local zone = map and map:FindFirstChild("SpawnZone")
-    if not zone then
+    local map=self:Map()
+    local zone=map and map:FindFirstChild("SpawnZone")
+    if not zone or not zone:IsA("BasePart") then
+        self.LastError="SpawnZone missing; cannot bank"
         return false
     end
-    self:SetStatus("Moving to spawn to bank treasure...", "MOVE")
-    local reached = self:WalkIntoZone(zone)
-    if reached then
-        self:SetStatus("Banking treasure at spawn...", "BANK")
+    self:SetStatus("Returning through center aisle to bank treasure...", "MOVE")
+    local function inside()
+        local _,_,r=self:GetCharacter()
+        return r and self:IsPointInsidePart(zone,r.Position,0.3)==true
     end
-    return reached
+    if inside() then return true end
+    local bankPoint=self:GetSafeSpawnBankPoint(zone)
+    if bankPoint then
+        local ok=self:WalkToPosition(bankPoint,{
+            AcceptanceRadius=1.5,Exclude=zone,
+            ArrivalPredicate=inside,MaxAttempts=4,
+        })
+        if ok and inside() then
+            self:SetStatus("Inside SpawnZone; confirming bank...", "BANK")
+            return true
+        end
+    end
+    -- Keep the original alternate entry points for maps streaming in.
+    if self:WalkIntoZone(zone) and inside() then
+        self:SetStatus("Inside SpawnZone; confirming bank...", "BANK")
+        return true
+    end
+    self.LastError="Failed to enter banking zone after returning from stages"
+    return false
 end
 
 function P:ClearRunState()
@@ -3060,38 +3112,90 @@ function P:CollectBestRewards(limit)
     return collected
 end
 
-function P:BankRun()
-    if not self.Settings.AutoBank then
-        return false
-    end
-    local previousReset = self.Run.LastReset
-    local previousBank = self.Run.LastBank
-    if not self:MoveToSpawn() then
-        return false
-    end
-    local ok = self:WaitUntil(function()
-        local backpackEmpty = self:BackpackCount() == 0
-        local banked = self.Run.LastBank > previousBank
-        local reset = self.Run.LastReset > previousReset or self:HighestCleared() == 0
-        return backpackEmpty and (banked or reset)
-    end, 4.5, 0.05)
-    if not ok then
-        -- Retrigger the bank zone by moving out and back in.
-        local map = self:Map()
-        local zone = map and map:FindFirstChild("SpawnZone")
-        if zone and zone:IsA("BasePart") then
-            self:SetStatus("Bank did not trigger; moving out and back into SpawnZone...", "RECOVER")
-            self:WalkOutOfZone(zone, 8)
-            task.wait(0.1)
-            self:WalkIntoZone(zone)
+-- For a missed bank trigger, leave SpawnZone along the middle aisle. The old
+-- radial exit could run directly into a Sell/Arms shop trigger.
+function P:ExitSpawnForBankRetry(zone)
+    local _,h,r=self:GetCharacter()
+    if not h or not r then return false end
+    if not self:IsPointInsidePart(zone,r.Position,0) then return true end
+    local corridor=self:GetSpawnShopCorridor()
+    if corridor then
+        local forward=corridor.Forward
+        local half=zone.Size*0.5
+        local radius=math.abs(zone.CFrame.RightVector:Dot(forward))*half.X
+            +math.abs(zone.CFrame.UpVector:Dot(forward))*half.Y
+            +math.abs(zone.CFrame.LookVector:Dot(forward))*half.Z
+        local current=(r.Position-zone.Position):Dot(forward)
+        local exits={-forward*(radius+current+11),forward*(radius-current+11)}
+        for _, offset in ipairs(exits) do
+            local raw=r.Position+Vector3.new(offset.X,0,offset.Z)
+            local ground=self:ProjectToGround(raw,zone)
+            local goal=ground and self:GetTweenRootTarget(ground,h,r)
+            if goal and not self:IsPointInsidePart(zone,goal,0)
+                and not self:DestinationHitsMenuZone(goal)
+                and not self:RouteCrossesMenuZone(r.Position,goal,nil,4) then
+                local ok=self:WalkToPosition(ground,{
+                    AcceptanceRadius=1.75,Exclude=zone,MaxAttempts=2,
+                    ArrivalPredicate=function()
+                        local _,_,now=self:GetCharacter()
+                        return now and not self:IsPointInsidePart(zone,now.Position,0)
+                    end,
+                })
+                if ok then return true end
+            end
         end
-        self:WaitUntil(function()
-            return self:BackpackCount() == 0 and (self.Run.LastBank > previousBank or self:HighestCleared() == 0)
-        end, 4, 0.05)
     end
-    return self:BackpackCount() == 0
-        and (self.Run.LastBank > previousBank or self.Run.LastReset > previousReset
-            or self:HighestCleared() == 0)
+    return self:WalkOutOfZone(zone,8)
+end
+
+function P:BankRun()
+    if not self.Settings.AutoBank then return false end
+    local previousReset=self.Run.LastReset
+    local previousBank=self.Run.LastBank
+    local clearedBefore=self:HighestCleared()
+    local carriedBefore=self:BackpackCount()
+    local function confirmed()
+        local feedback=self.Run.LastReset>previousReset
+            or self.Run.LastBank>previousBank
+            or (clearedBefore>0 and self:HighestCleared()==0)
+        -- A StageTreasuresBanked event can arrive BEFORE RockLiftingFeedback
+        -- Reset: do not begin another cycle with old cleared-stage flags.
+        return feedback and self:HighestCleared()==0 and self:BackpackCount()==0
+    end
+    if confirmed() then return true end
+    if not self:MoveToSpawn() then
+        self:SetStatus("Return to spawn failed; preserving current run", "RECOVER")
+        return false
+    end
+    if self:WaitUntil(confirmed,2.3,0.05) then return true end
+    if self.Run.LastBank>previousBank and self:HighestCleared()>0 then
+        pcall(function() self.R.RockLiftingInput:FireServer("Sync") end)
+        if self:WaitUntil(confirmed,0.9,0.05) then return true end
+    end
+    local map=self:Map()
+    local zone=map and map:FindFirstChild("SpawnZone")
+    if not zone or not zone:IsA("BasePart") then return false end
+    for attempt=1,2 do
+        if not self.Alive or not self.Settings.Enabled then return false end
+        if confirmed() then return true end
+        self:SetStatus("Bank confirmation "..attempt.."/2: exiting and reentering spawn", "RECOVER")
+        if not self:ExitSpawnForBankRetry(zone) then
+            self.LastError="Cannot safely exit SpawnZone to retry banking"
+            return false
+        end
+        task.wait(0.18)
+        if not self:MoveToSpawn() then
+            self.LastError="Unable to reenter SpawnZone for bank retry"
+            return false
+        end
+        if self:WaitUntil(confirmed,1.8,0.05) then return true end
+    end
+    self.LastError=string.format(
+        "Bank not confirmed (cleared %d, backpack %d); preserving run",
+        clearedBefore,carriedBefore)
+    self:SetStatus("Bank not confirmed; preserving rewards for retry", "RECOVER")
+    pcall(function() self.R.RockLiftingInput:FireServer("Sync") end)
+    return false
 end
 
 function P:SellableInventory()
@@ -3862,8 +3966,13 @@ function P:RunProgressionCycle()
                 task.wait(0.65)
                 return
             else
-                -- An empty reward set can be reset safely.
-                self:BankRun()
+                -- Even filtered-out or empty rewards need an authoritative
+                -- reset. Never enter the next run on stale cleared flags.
+                if not self:BankRun() then
+                    self:SetStatus("Waiting for spawn reset before next rock run...", "RECOVER")
+                    task.wait(0.3)
+                    return
+                end
             end
         else
             self:SetStatus("Collected " .. tostring(collected) .. " treasure; Auto Bank is disabled", "PAUSED")
