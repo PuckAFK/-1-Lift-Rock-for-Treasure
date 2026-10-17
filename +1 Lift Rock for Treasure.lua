@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.9 - Return-to-Spawn + Bank Loop Fix
+    Smart AutoFarm v1.8.0 - Ground Navigation + Sell Debug
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.9",
+    Version = "1.8.0",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -91,6 +91,8 @@ local P = {
     LastSpecialSync = 0,
     LastFreeClaim = 0,
     UI = {},
+    Debug = {Entries = {}, LastStatus = "", LastStatusTime = 0, LastRouteIssue = ""},
+    ShopRetryAfter = {},
     Run = {
         Cleared = {},
         Rewards = {},
@@ -163,8 +165,8 @@ P.Settings = {
     TweenSpeed = 600, -- New Farming-tab setting; legacy saved Settings speed is ignored. 20-750 studs/s.
     TweenWaypointSpacing = 8,
     AvoidUnwantedShops = true, -- Always enabled: do not cut across tagged shop/menu zones.
-    SkyShopClearance = 1.5, -- Minimal clearance above crossed roofs; sky used ONLY over shops.
     AutoDismissShopMenus = true, -- Restore controls when a shop popup blocks AFK farming.
+    DebugConsole = true, -- Detailed tagged logs; toggle in the Debug tab.
 
     -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
     MinPickupRarity = "Any",
@@ -294,11 +296,66 @@ function P:Spawn(callback)
     return thread
 end
 
-function P:SetStatus(text, phase)
-    self.Status = tostring(text or "")
-    if phase then
-        self.Phase = phase
+function P:DebugEvent(kind, message)
+    local debug = self.Debug
+    if not debug then return end
+    local line = string.format("[%s][%s][%s] %s",
+        os.date("%H:%M:%S"), tostring(self.Phase or "BOOT"),
+        tostring(kind or "INFO"), tostring(message or ""))
+    table.insert(debug.Entries, line)
+    while #debug.Entries > 75 do table.remove(debug.Entries, 1) end
+    if self.Settings.DebugConsole then
+        if kind == "ERROR" or kind == "FAIL" then
+            warn("[PuckAFK Lift Rock] "..line)
+        else
+            print("[PuckAFK Lift Rock] "..line)
+        end
     end
+end
+
+function P:DebugSnapshot()
+    local character = self.Player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local position = root and root.Position
+    local function pos(value)
+        if typeof(value) ~= "Vector3" then return "none" end
+        return string.format("%.1f, %.1f, %.1f", value.X, value.Y, value.Z)
+    end
+    local nav = self.Navigation
+    local allowed = nav.AllowedShopZone
+    local lastError = tostring(self.LastError or "none")
+    return string.format(
+        "Version %s  |  phase %s\nStatus: %s\nPosition: %s\nDestination: %s\nNavigation: %s; busy=%s; repaths=%s; waypoint=%s\nShop permission: %s  |  speed=%s\nLast navigation failure: %s\nLast error: %s",
+        self.Version, tostring(self.Phase), tostring(self.Status),
+        pos(position), pos(nav.Destination), tostring(nav.LastResult),
+        tostring(nav.Busy), tostring(nav.Repaths), tostring(nav.Waypoint),
+        allowed and allowed:GetFullName() or "none",
+        tostring(self.Settings.TweenSpeed),
+        tostring(self.Debug.LastRouteIssue or "none"), lastError
+    )
+end
+
+function P:GetDebugReport()
+    local lines = {self:DebugSnapshot(), "", "Recent events (oldest to newest):"}
+    for _, line in ipairs(self.Debug.Entries) do table.insert(lines, line) end
+    return table.concat(lines, "\n")
+end
+
+function P:SetStatus(text, phase)
+    local newStatus = tostring(text or "")
+    local newPhase = phase or self.Phase
+    local debug = self.Debug
+    if debug and (newPhase ~= self.Phase or newStatus ~= self.Status)
+        and (newPhase ~= debug.LastStatusPhase
+            or newStatus ~= debug.LastStatus
+            or os.clock() - (debug.LastStatusTime or 0) > 1.6) then
+        debug.LastStatus = newStatus
+        debug.LastStatusPhase = newPhase
+        debug.LastStatusTime = os.clock()
+        self:DebugEvent("STATE", tostring(newPhase).." :: "..newStatus)
+    end
+    self.Status = newStatus
+    if phase then self.Phase = phase end
 end
 
 function P:Data()
@@ -668,147 +725,7 @@ end
 
 -- Return the shop *building* containing a menu trigger, not other tagged UI
 -- zones elsewhere in the map. Only shop buildings can cause a sky-hop.
-function P:GetShopBuildingForTrigger(zone)
-    local map = self:Map()
-    local shops = map and map:FindFirstChild("Shops")
-    if not shops or not zone then return nil end
-    local ancestor = zone
-    while ancestor and ancestor.Parent ~= shops do
-        ancestor = ancestor.Parent
-    end
-    if ancestor and ancestor.Parent == shops then return ancestor end
-    return nil
-end
-
--- 2-D entry/exit fractions against a rotated shop zone's horizontal bounds.
--- The route's Y is deliberately ignored: we need the shop footprint, not the
--- height of a decorative part or an unrelated ZoneOpener.
-function P:ShopFootprintWindow(fromRoot, toRoot, zone)
-    if not zone or typeof(fromRoot) ~= "Vector3" or typeof(toRoot) ~= "Vector3" then
-        return nil
-    end
-    -- Prefer the whole shop building footprint, not just its smaller invisible
-    -- trigger: this ensures the ascent and landing are OUTSIDE the actual roof.
-    local cf, half = zone.CFrame, zone.Size * 0.5
-    local building = self:GetShopBuildingForTrigger(zone)
-    if building and building:IsA("Model") then
-        local ok, boundingCF, boundingSize = pcall(function()
-            return building:GetBoundingBox()
-        end)
-        if ok and boundingCF and boundingSize then
-            cf, half = boundingCF, boundingSize * 0.5
-        end
-    end
-    local hx = math.abs(cf.RightVector.X) * half.X
-        + math.abs(cf.UpVector.X) * half.Y
-        + math.abs(cf.LookVector.X) * half.Z + 7
-    local hz = math.abs(cf.RightVector.Z) * half.X
-        + math.abs(cf.UpVector.Z) * half.Y
-        + math.abs(cf.LookVector.Z) * half.Z + 7
-    local dx, dz = toRoot.X - fromRoot.X, toRoot.Z - fromRoot.Z
-    local first, last = 0, 1
-    for _, axis in ipairs({
-        {fromRoot.X - cf.Position.X, dx, hx},
-        {fromRoot.Z - cf.Position.Z, dz, hz},
-    }) do
-        local origin, direction, radius = axis[1], axis[2], axis[3]
-        if math.abs(direction) < 0.0001 then
-            if math.abs(origin) > radius then return nil end
-        else
-            local a = (-radius - origin) / direction
-            local b = ( radius - origin) / direction
-            if a > b then a, b = b, a end
-            first, last = math.max(first, a), math.min(last, b)
-            if first > last then return nil end
-        end
-    end
-    return first, last
-end
-
--- Cross only the nearest connected cluster of shop footprints. Widely spaced
--- shops get independent low hops with grounded travel between them.
-function P:GetNextShopHopWindow(fromRoot, toRoot, allowedZone)
-    local distance = Vector3.new(toRoot.X - fromRoot.X, 0,
-        toRoot.Z - fromRoot.Z).Magnitude
-    if distance < 2 then return nil end
-    local intersections = {}
-    for _, entry in ipairs(self:GetMenuTriggerZones()) do
-        if entry.Part ~= allowedZone and self:GetShopBuildingForTrigger(entry.Part) then
-            local first, last = self:ShopFootprintWindow(fromRoot, toRoot, entry.Part)
-            if first and last and last > 0 and first < 1 then
-                table.insert(intersections, {
-                    First = math.max(0, first), Last = math.min(1, last),
-                    Entry = entry,
-                })
-            end
-        end
-    end
-    table.sort(intersections, function(a,b) return a.First < b.First end)
-    if #intersections == 0 then return nil end
-    local before, after = intersections[1].First, intersections[1].Last
-    local selected = {intersections[1].Entry}
-    for index = 2, #intersections do
-        local nextZone = intersections[index]
-        if nextZone.First > after + 18 / distance then break end
-        after = math.max(after, nextZone.Last)
-        table.insert(selected, nextZone.Entry)
-    end
-    -- 12 studs outside the padded zone edges for takeoff and landing.
-    -- Never extend past the requested destination.
-    return {
-        Before = math.max(0, before - 12 / distance),
-        After = math.min(1, after + 12 / distance),
-        Entries = selected,
-    }
-end
-
-function P:GetShopSafeAltitude(currentRoot, goalRoot, entries, humanoid, root)
-    -- Height is measured from the actual shop roofs and the crossed trigger
-    -- upper bounds. Decorative towers or menu zones elsewhere do not count.
-    local offset = self:GetRootGroundOffset(humanoid, root)
-    local clearance = 1.5
-    local roofTop = -math.huge
-    local visited = {}
-    for _, entry in ipairs(entries or {}) do
-        local zone = entry.Part
-        local building = self:GetShopBuildingForTrigger(zone)
-        if building and not visited[building] then
-            visited[building] = true
-            local explicitRoofTop, broadPartTop = -math.huge, -math.huge
-            for _, part in ipairs(building:GetDescendants()) do
-                if part:IsA("BasePart") and part ~= zone and part.CanCollide then
-                    local half = part.Size * 0.5
-                    local cf = part.CFrame
-                    local upper = part.Position.Y
-                        + math.abs(cf.RightVector.Y) * half.X
-                        + math.abs(cf.UpVector.Y) * half.Y
-                        + math.abs(cf.LookVector.Y) * half.Z
-                    local name = string.lower(part.Name)
-                    if name:find("roof", 1, true) or name:find("ceiling", 1, true) then
-                        explicitRoofTop = math.max(explicitRoofTop, upper)
-                    elseif part.Size.X * part.Size.Z >= 15 then
-                        -- Ignore tall decorative signs and skinny antennas.
-                        broadPartTop = math.max(broadPartTop, upper)
-                    end
-                end
-            end
-            local actualRoof = explicitRoofTop > -math.huge and explicitRoofTop
-                or broadPartTop
-            roofTop = math.max(roofTop, actualRoof)
-        end
-        -- Keep the avatar above the ZoneOpener itself; if an invisible zone
-        -- extends above the roof, clearing the actual trigger is mandatory.
-        local half, cf = zone.Size * 0.5, zone.CFrame
-        local zoneTop = zone.Position.Y
-            + math.abs(cf.RightVector.Y) * half.X
-            + math.abs(cf.UpVector.Y) * half.Y
-            + math.abs(cf.LookVector.Y) * half.Z
-        roofTop = math.max(roofTop, zoneTop)
-    end
-    if roofTop == -math.huge then return nil end
-    return roofTop + offset + clearance
-end
-
+-- No airborne navigation: normal travel stays on the ground.
 function P:DismissBlockingShopMenus()
     if not self.Alive or not self.Settings.Enabled or not self.Settings.AutoDismissShopMenus then
         return false
@@ -991,117 +908,7 @@ function P:GetSpawnShopCorridor()
     return {Lane=lane, Forward=forward, Min=minimum, Max=maximum, Roof=roof}
 end
 
-function P:GetSpawnShopCorridorPlan(fromRoot, toRoot, allowedZone)
-    if allowedZone or not self.Settings.AvoidUnwantedShops then return nil end
-    local route = self:GetSpawnShopCorridor()
-    if not route then return nil end
-    local startAlong = (fromRoot - route.Lane):Dot(route.Forward)
-    local endAlong = (toRoot - route.Lane):Dot(route.Forward)
-    local outbound = endAlong > route.Max+9
-        and startAlong < route.Max+7 and startAlong > route.Min-95
-        and endAlong > startAlong+14
-    local inbound = startAlong > route.Max+9 and endAlong < route.Max+5
-        and endAlong > route.Min-95 and startAlong > endAlong+14
-    if not outbound and not inbound then return nil end
-    route.TakeoffAlong = math.clamp(startAlong, route.Min-18, route.Max+18)
-    -- On the return trip land OUTSIDE the stalls, never inside their trigger
-    -- footprint. Continue toward the real SpawnZone only after touchdown.
-    route.LandingAlong = outbound and route.Max+14
-        or route.Min-18
-    return route
-end
-
-function P:ApproachSpawnCenter(surface, token)
-    local _, humanoid, root = self:GetCharacter()
-    if not root or not humanoid then return false, "character" end
-    -- Recover from an earlier failed move leaving the avatar inside a menu ring.
-    for _, entry in ipairs(self:GetMenuTriggerZones()) do
-        if self:IsWithinMenuZone(root.Position, entry.Part, 0) then
-            self.Navigation.LastResult = "Escaping shop before center ascent"
-            if not self:ExitOccupiedMenuZone(token) then
-                return false, "cannot exit occupied shop"
-            end
-            _, humanoid, root = self:GetCharacter()
-            if not root or not humanoid then return false, "character" end
-            break
-        end
-    end
-    local target = self:GetTweenRootTarget(surface, humanoid, root)
-    if not target then return false, "goal" end
-    if (root.Position-target).Magnitude <= 3 then return true end
-    local ok, why = self:TweenWaypoint(surface,
-        Enum.PathWaypointAction.Walk, token, 2.25)
-    if ok then return true end
-    -- Physical stalls may obstruct the lateral approach to the center aisle.
-    -- Pathfind only this grounded approach; no blind CFrame snap.
-    local path = self.S.PathfindingService:CreatePath({
-        AgentRadius=2, AgentHeight=5, AgentCanJump=true, WaypointSpacing=7,
-    })
-    local computed = pcall(function() path:ComputeAsync(root.Position, surface) end)
-    if not computed or path.Status ~= Enum.PathStatus.Success then
-        return false, "center approach: "..tostring(why)
-    end
-    local points = path:GetWaypoints()
-    for index=2,#points do
-        if not self:IsWalkTokenActive(token) then return false,"cancelled" end
-        local point=points[index]
-        local reached,reason=self:TweenWaypoint(point.Position,point.Action,
-            token,index==#points and 2.25 or 1.5)
-        if not reached then return false,"center path: "..tostring(reason) end
-    end
-    return true
-end
-
--- Rise from the central spawn walkway, cross ABOVE the four stalls, then
--- promptly land beyond them and continue normal route to the requested stage.
-function P:FlyOverMenuZones(groundDestination, token, allowedZone, acceptance, predicate)
-    local _,humanoid,root=self:GetCharacter()
-    if not humanoid or not root or humanoid.Health<=0 then return false,"character" end
-    local targetRoot=self:GetTweenRootTarget(groundDestination,humanoid,root)
-    if not targetRoot then return false,"goal" end
-    local plan=self:GetSpawnShopCorridorPlan(root.Position,targetRoot,allowedZone)
-    if not plan then return false,"no central shop crossing needed" end
-    local entry=plan.Lane+plan.Forward*plan.TakeoffAlong
-    local landing=plan.Lane+plan.Forward*plan.LandingAlong
-    local floorY=root.Position.Y-self:GetRootGroundOffset(humanoid,root)
-    local entryGround=self:ProjectToGround(Vector3.new(entry.X,floorY,entry.Z))
-    local landingGround=self:ProjectToGround(Vector3.new(landing.X,floorY,landing.Z))
-    if not entryGround or not landingGround then return false,"no corridor ground" end
-    local entryRoot=self:GetTweenRootTarget(entryGround,humanoid,root)
-    local landingRoot=self:GetTweenRootTarget(landingGround,humanoid,root)
-    if self:DestinationHitsMenuZone(entryRoot)
-        or self:DestinationHitsMenuZone(landingRoot) then
-        return false,"corridor endpoint overlaps shop"
-    end
-    self.Navigation.SkyTravel=true
-    self.Navigation.SkyAscent=false
-    self.Navigation.LastResult="Moving to spawn center aisle"
-    local ok,why=self:ApproachSpawnCenter(entryGround,token)
-    if not ok then return false,why end
-    _,humanoid,root=self:GetCharacter()
-    if not humanoid or not root then return false,"character" end
-    local offset=self:GetRootGroundOffset(humanoid,root)
-    local roofY=math.max(plan.Roof+offset+5,root.Position.Y+3,landingRoot.Y+3)
-    local up=Vector3.new(root.Position.X,roofY-offset,root.Position.Z)
-    local crossing=Vector3.new(landingRoot.X,roofY-offset,landingRoot.Z)
-    self.Navigation.SkyAscent=true
-    self.Navigation.LastResult="Going up over shop roofs from spawn center"
-    ok,why=self:TweenWaypoint(up,Enum.PathWaypointAction.Walk,token,1.75)
-    self.Navigation.SkyAscent=false
-    if not ok then return false,"center ascent: "..tostring(why) end
-    self.Navigation.LastResult="Crossing sky over central walkway toward stages"
-    ok,why=self:TweenWaypoint(crossing,Enum.PathWaypointAction.Walk,token,1.75)
-    if not ok then return false,"center crossing: "..tostring(why) end
-    self.Navigation.LastResult = plan.Outbound
-        and "Landing on stage side of shops"
-        or "Landing on spawn side of shops"
-    ok,why=self:TweenWaypoint(landingGround,Enum.PathWaypointAction.Walk,token,2.25)
-    if not ok then return false,"center descent: "..tostring(why) end
-    self.Navigation.SkyTravel=false
-    -- This finishes the shop crossing, NOT the actual banking destination.
-    return true, plan.Outbound and "stage-side landing" or "spawn-side landing"
-end
-
+-- Sky travel removed in v1.8.0. Ground waypoints and shop avoidance remain.
 function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
     if typeof(fromSurface) ~= "Vector3" or typeof(toSurface) ~= "Vector3" then
         return false
@@ -1471,8 +1278,11 @@ function P:WalkToPosition(goalPosition, options)
     self:ReleaseTweenBody() -- never carry an old route's collision state forward
 
     self.Navigation.Destination = projected
-    self.Navigation.LastResult = "Tweening"
+    self.Navigation.LastResult = "Ground tween route"
     self.Navigation.Repaths = 0
+    self:DebugEvent("ROUTE", string.format("Begin %s -> %s | shop=%s",
+        tostring(root.Position), tostring(projected),
+        tostring(options.AllowedShopZone and options.AllowedShopZone:GetFullName() or "none")))
     self.Navigation.Busy = true
     self.Navigation.Waypoint = 0
     self.Navigation.AllowedShopZone = options.AllowedShopZone
@@ -1506,6 +1316,14 @@ function P:WalkToPosition(goalPosition, options)
 
             self.Navigation.Destination = nil
             self.Navigation.LastResult = text or (result and "Arrived" or "Failed")
+            if not result then
+                self.Debug.LastRouteIssue = tostring(self.Navigation.LastResult)
+                self:DebugEvent("FAIL", string.format("Route to %s failed: %s",
+                    tostring(projected), tostring(self.Navigation.LastResult)))
+            elseif self.Settings.DebugConsole then
+                self:DebugEvent("ARRIVE", string.format("Route complete: %s",
+                    tostring(projected)))
+            end
             self.Navigation.Busy = false
             self.Navigation.Waypoint = 0
             self.Navigation.AllowedShopZone = nil
@@ -1521,11 +1339,8 @@ function P:WalkToPosition(goalPosition, options)
         8
     )
 
-    -- Shop hops are transit steps, not failed navigation attempts. Allow up
-    -- to four separate shop clusters without consuming the ground repath budget.
-    local skyHops = 0
-    for attempt = 1, maxAttempts + 4 do
-        if attempt > maxAttempts + skyHops then break end
+    -- Ground only: no ascent or sky-hop loop and no extra airborne retries.
+    for attempt = 1, maxAttempts do
         if not self:IsWalkTokenActive(token) then
             return finish(false, "Cancelled")
         end
@@ -1554,40 +1369,7 @@ function P:WalkToPosition(goalPosition, options)
         self.Navigation.Repaths = attempt - 1
         local projectedRoot = self:GetTweenRootTarget(projected, humanoid, root)
         local distance = projectedRoot and (root.Position - projectedRoot).Magnitude or 0
-        -- The center route is chosen for travel from spawn past the four
-        -- stalls toward stages, even when no invisible ring intersects the line.
-        local shopWindow = projectedRoot and self:GetSpawnShopCorridorPlan(
-            root.Position, projectedRoot, options.AllowedShopZone
-        )
-        if shopWindow then
-            local moved, reason = self:FlyOverMenuZones(
-                projected, token, options.AllowedShopZone, acceptance, arrivalPredicate
-            )
-            if moved then
-                skyHops += 1
-                if skyHops > 4 then
-                    return finish(false, "Too many shop crossings; stopping safely")
-                end
-                -- A sky hop lands immediately past the shop, NOT at the final
-                -- destination. Continue normal routing from the ground.
-                self.Navigation.LastResult = "Shop cleared; continuing on ground"
-                if authoritativeArrival and self:WalkArrivalSatisfied(arrivalPredicate) then
-                    return finish(true, "Arrived")
-                end
-                local _, h, r = self:GetCharacter()
-                local finalRoot = h and r and self:GetTweenRootTarget(projected, h, r)
-                if finalRoot and (r.Position - finalRoot).Magnitude <= acceptance then
-                    return finish(true, "Arrived")
-                end
-                -- Re-evaluate from the grounded position without hovering or
-                -- repeating a sky trip over the rest of the map.
-                continue
-            end
-            -- Fail safely instead of hanging airborne on repeated attempts.
-            self.LastError = "Central shop corridor: " .. tostring(reason)
-            return finish(false, self.LastError)
-        end
-
+        -- Ground-only pathfinding, including all travel to stages and shops.
         self.Navigation.LastResult = attempt == 1
             and "Planning tween route"
             or ("Tween repath " .. tostring(attempt - 1))
@@ -1757,10 +1539,14 @@ function P:WalkToPosition(goalPosition, options)
         end
 
         self.Navigation.LastResult = tostring(failureReason) .. " • repathing"
+        self.Debug.LastRouteIssue = string.format(
+            "Attempt %d/%d: %s, destination=%s",
+            attempt, maxAttempts, tostring(failureReason), tostring(projected))
+        self:DebugEvent("REPATH", self.Debug.LastRouteIssue)
         task.wait(0.12 + math.min(0.28, attempt * 0.04))
     end
 
-    return finish(false, "Tween route failed")
+    return finish(false, self.Debug.LastRouteIssue or "Ground tween route failed")
 end
 
 function P:WalkToObject(object, acceptance)
@@ -1845,16 +1631,21 @@ function P:WalkIntoZone(zone, intentionalShop)
         if inside() then
             return true
         end
+        if intentionalShop and index > 3 then break end
         self.Navigation.LastResult = index == 1 and "Entering zone" or ("Alternate zone entry " .. tostring(index - 1))
         local reached = self:WalkToPosition(goal, {
             AcceptanceRadius = 1.15,
             Exclude = zone,
             AllowedShopZone = intentionalShop and zone or nil,
-            MaxAttempts = index == 1 and 4 or 2,
+            MaxAttempts = intentionalShop and 2 or (index == 1 and 4 or 2),
             ArrivalPredicate = inside,
         })
         if reached and inside() then
             return true
+        end
+        if intentionalShop then
+            self:DebugEvent("SHOP", "Zone entry candidate "..index..
+                " failed: "..tostring(self.Debug.LastRouteIssue))
         end
     end
 
@@ -3218,21 +3009,87 @@ function P:SellableInventory()
     return result
 end
 
+-- Ground-level shop approaches use the center spawn aisle, not roof ascent.
+-- A failed shop visit is temporarily backed off so selling cannot freeze
+-- all rebirth/stage progression in a loop.
 function P:GoToShopZone(shopName)
+    local now = os.clock()
+    local nextTry = self.ShopRetryAfter[shopName] or 0
+    if now < nextTry then
+        self:SetStatus(string.format("Waiting %.0fs before retrying %s shop",
+            nextTry - now, tostring(shopName)), "RECOVER")
+        return false
+    end
     local map = self:Map()
     local shops = map and map:FindFirstChild("Shops")
     local shop = shops and shops:FindFirstChild(shopName)
-    local zone = shop and (shop:FindFirstChild("Zone") or shop:FindFirstChild("Zone", true))
-    if zone and zone:IsA("BasePart") then
-        self:SetStatus("Moving to " .. tostring(shopName) .. " shop...", "MOVE")
-        local reached = self:WalkIntoZone(zone, true)
-        if reached then
-            task.wait(0.12)
-            self:DismissBlockingShopMenus()
-        end
-        return reached
+    local zone = shop and shop:FindFirstChild("Zone", true)
+    if not zone or not zone:IsA("BasePart") then
+        self.LastError = "Missing shop trigger: "..tostring(shopName)
+        self.ShopRetryAfter[shopName] = now + 12
+        self:DebugEvent("FAIL", self.LastError)
+        return false
     end
-    self.LastError = "Missing shop zone: " .. tostring(shopName)
+    local function inside()
+        local character = self.Player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        return root and self:IsPointInsidePart(zone, root.Position, 0.08)
+    end
+    self:SetStatus("Moving to "..tostring(shopName).." shop on ground...", "MOVE")
+    self:DebugEvent("SHOP", string.format("%s start, trigger=%s size=%s",
+        tostring(shopName), tostring(zone.Position), tostring(zone.Size)))
+    if inside() then return true end
+
+    local corridor = self:GetSpawnShopCorridor()
+    local character = self.Player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if corridor and root then
+        local side = (root.Position - corridor.Lane):Dot(corridor.Forward)
+        local startAlong = side > corridor.Max
+            and corridor.Max + 16 or corridor.Min - 16
+        local shopAlong = (zone.Position - corridor.Lane):Dot(corridor.Forward)
+        local stages = {
+            corridor.Lane + corridor.Forward * startAlong,
+            corridor.Lane + corridor.Forward * shopAlong,
+        }
+        for i, point in ipairs(stages) do
+            if inside() then return true end
+            local floor = self:ProjectToGround(point)
+            local _, h, r = self:GetCharacter()
+            local rootGoal = floor and h and r
+                and self:GetTweenRootTarget(floor, h, r)
+            if rootGoal and not self:DestinationHitsMenuZone(rootGoal, zone)
+                and (r.Position - rootGoal).Magnitude > 3 then
+                self:DebugEvent("SHOP", string.format(
+                    "%s center aisle waypoint %d at %s",
+                    tostring(shopName), i, tostring(floor)))
+                local ok = self:WalkToPosition(floor, {
+                    AcceptanceRadius = 2.5, MaxAttempts = 2,
+                })
+                if not ok then
+                    self:DebugEvent("SHOP", "Aisle waypoint "..i..
+                        " failed ("..tostring(self.Debug.LastRouteIssue).."); trying shop entry")
+                    break
+                end
+            end
+        end
+    end
+
+    local reached = self:WalkIntoZone(zone, true)
+    if reached and inside() then
+        self.ShopRetryAfter[shopName] = nil
+        self.Debug.LastRouteIssue = ""
+        self:DebugEvent("SHOP", tostring(shopName).." trigger entered successfully")
+        task.wait(0.08)
+        self:DismissBlockingShopMenus()
+        return true
+    end
+
+    self.ShopRetryAfter[shopName] = os.clock() + 12
+    self.LastError = string.format("%s shop unreachable: %s",
+        tostring(shopName), tostring(self.Debug.LastRouteIssue or "zone entry failed"))
+    self:DebugEvent("FAIL", self.LastError)
+    self:SetStatus("Shop route failed; continuing farming (retry in 12s)", "RECOVER")
     return false
 end
 
@@ -3260,6 +3117,8 @@ function P:SellInventory()
         return false
     end
     if not self:GoToShopZone("Sell") then
+        self:DebugEvent("SELL", "Sell deferred; "..tostring(#items)..
+            " banked items retained for next attempt")
         return false
     end
     self:SetStatus("Selling " .. tostring(#items) .. " banked treasures...", "SELL")
@@ -4278,6 +4137,44 @@ function P:CreateUI()
     bindToggle(upgrades, "Claim Offline Rewards", "AutoOfflineReward")
     bindToggle(upgrades, "Claim Group Reward", "AutoGroupReward")
 
+    local debugTab = window:CreateTab("Debug")
+    debugTab:CreateSection("Navigation Diagnostics")
+    local debugLive = debugTab:CreateParagraph({
+        Title = "Live Route",
+        Content = "Waiting for debug updates...",
+        Height = 175,
+    })
+    local debugEvents = debugTab:CreateParagraph({
+        Title = "Recent Events",
+        Content = "No events yet",
+        Height = 130,
+    })
+    bindToggle(debugTab, "Log to Executor Console", "DebugConsole")
+    debugTab:CreateButton({
+        Name = "Copy Debug Log",
+        Callback = function()
+            local report = self:GetDebugReport()
+            if type(setclipboard) == "function" then
+                local ok = pcall(setclipboard, report)
+                if ok then
+                    PuckUI:Notify({Title = "Debug", Content = "Debug report copied", Duration = 3})
+                    return
+                end
+            end
+            print(report)
+            PuckUI:Notify({Title = "Debug", Content = "Clipboard unavailable; printed to console", Duration = 4})
+        end,
+    })
+    debugTab:CreateButton({
+        Name = "Recover Stuck Movement",
+        Callback = function()
+            self:DebugEvent("MANUAL", "User requested movement recovery")
+            self:StopWalking()
+            self.ShopRetryAfter = {}
+            self:SetStatus("Movement reset; retrying ground route...", "RECOVER")
+        end,
+    })
+
     local settingsTab = window:CreateTab("Settings")
     settingsTab:CreateSection("General")
     bindToggle(settingsTab, "Anti AFK", "AntiAFK")
@@ -4324,6 +4221,12 @@ function P:CreateUI()
                 Content = goalText,
             })
 
+            debugLive:Set({Title = "Live Route", Content = self:DebugSnapshot()})
+            local recent = self.Debug.Entries
+            local from = math.max(1, #recent - 3)
+            local selected = {}
+            for i = from, #recent do table.insert(selected, recent[i]) end
+            debugEvents:Set({Title = "Recent Events", Content = table.concat(selected, "\n")})
             task.wait(0.35)
         end
     end)
@@ -4360,7 +4263,7 @@ function P:MainLoop()
                 end)
                 task.wait(0.75)
             else
-                self.LastError = nil
+                -- Preserve the most recent recoverable navigation error in Debug.
                 task.wait(0.05)
             end
         end
