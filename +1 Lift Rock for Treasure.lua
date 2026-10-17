@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.7.7 - Low-Roof Shop Hop + Instant Descent
+    Smart AutoFarm v1.7.8 - Center-Spawn Shop Sky Corridor
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.7.7",
+    Version = "1.7.8",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -916,85 +916,185 @@ function P:ExitOccupiedMenuZone(token)
     return false
 end
 
--- Only hop over shop buildings actually crossed by this route. Travel to the
--- near side at ground level, climb to just over the crossed shop rooftops,
--- cross, and LAND immediately on the far side. The route then resumes normal
--- ground tweening to its destination; it never cruises across the whole map.
-function P:FlyOverMenuZones(groundDestination, token, allowedZone, acceptance, predicate)
-    local _, humanoid, root = self:GetCharacter()
-    if not root or not humanoid or humanoid.Health <= 0 then return false, "character" end
-    local targetRoot = self:GetTweenRootTarget(groundDestination, humanoid, root)
-    if not targetRoot then return false, "goal" end
-    if self:DestinationHitsMenuZone(targetRoot, allowedZone) then
-        return false, "destination inside shop trigger"
-    end
-    local window = self:GetNextShopHopWindow(root.Position, targetRoot, allowedZone)
-    if not window then return false, "no intersecting shop building" end
-    local travel = Vector3.new(targetRoot.X - root.Position.X, 0,
-        targetRoot.Z - root.Position.Z)
-    local function groundAt(t)
-        local sample = root.Position + travel * t
-        return self:ProjectToGround(sample)
-    end
-    local beforeGround, afterGround = groundAt(window.Before), groundAt(window.After)
-    if not beforeGround or not afterGround then return false, "no safe ground" end
-    local beforeRoot = self:GetTweenRootTarget(beforeGround, humanoid, root)
-    local afterRoot = self:GetTweenRootTarget(afterGround, humanoid, root)
-    if self:DestinationHitsMenuZone(beforeRoot, allowedZone)
-        or self:DestinationHitsMenuZone(afterRoot, allowedZone) then
-        return false, "takeoff/landing near a shop trigger"
-    end
-
-    self.Navigation.SkyTravel = true
-    self.Navigation.SkyAscent = false
-    -- Approach is entirely on the ground. Direct unsafe shortcuts are rejected.
-    if (beforeRoot - root.Position).Magnitude > 2.5 then
-        self.Navigation.LastResult = "Approaching shops on ground"
-        local ok, why = self:TweenWaypoint(beforeGround,
-            Enum.PathWaypointAction.Walk, token, 2.5)
-        if not ok then return false, "approach: " .. tostring(why) end
-    end
-    _, humanoid, root = self:GetCharacter()
-    if not root or not humanoid or humanoid.Health <= 0 then return false, "character" end
-    local topY = self:GetShopSafeAltitude(root.Position, afterRoot,
-        window.Entries, humanoid, root)
-    if not topY then return false, "shop roof missing" end
-    local offset = self:GetRootGroundOffset(humanoid, root)
-    local ascentGround = Vector3.new(root.Position.X, topY - offset, root.Position.Z)
-    local crossingGround = Vector3.new(afterRoot.X, topY - offset, afterRoot.Z)
-
-    self.Navigation.SkyAscent = true
-    self.Navigation.LastResult = "Low ascent to shop roof"
-    local ok, why = self:TweenWaypoint(ascentGround,
-        Enum.PathWaypointAction.Walk, token, 1.25)
-    if not ok and tostring(why) == "obstacle" then
-        -- A character left *inside* a shop may have a roof over their head.
-        -- Escape sideways rather than raising the altitude of every route.
-        if self:ExitOccupiedMenuZone(token) then
-            local _, h, r = self:GetCharacter()
-            if r and h then
-                ascentGround = Vector3.new(r.Position.X, topY - self:GetRootGroundOffset(h,r),r.Position.Z)
-                ok, why = self:TweenWaypoint(ascentGround,
-                    Enum.PathWaypointAction.Walk, token, 1.25)
+-- Route through the open middle of the four shop stalls, aligned to spawn
+-- and toward Stage 1. No guessed world coordinates or shop-edge ascents.
+function P:GetSpawnShopCorridor()
+    local map = self:Map()
+    local shops = map and map:FindFirstChild("Shops")
+    local spawn = map and map:FindFirstChild("SpawnZone")
+    local stage = self:GetStage(1)
+    local lift = stage and stage:FindFirstChild("LiftZone", true)
+    if not shops or not spawn or not lift then return nil end
+    local names = {Sell = true, Arms = true, Aura = true, Auras = true, Upgrades = true}
+    local stores, center = {}, Vector3.zero
+    for _, model in ipairs(shops:GetChildren()) do
+        if names[model.Name] then
+            local zone = model:FindFirstChild("Zone", true)
+            if zone and zone:IsA("BasePart") then
+                table.insert(stores, {Model = model, Zone = zone})
+                center += zone.Position
             end
         end
     end
-    self.Navigation.SkyAscent = false
-    if not ok then return false, "low ascent: " .. tostring(why) end
+    -- Never use an unverified corridor when shop models are still streaming.
+    if #stores < 4 then return nil end
+    center /= #stores
+    local direction = Vector3.new(lift.Position.X - spawn.Position.X,
+        0, lift.Position.Z - spawn.Position.Z)
+    if direction.Magnitude < 12 then return nil end
+    local forward = direction.Unit
+    local right = Vector3.new(-forward.Z, 0, forward.X)
+    local lateral = math.clamp((spawn.Position - center):Dot(right), -5, 5)
+    local lane = Vector3.new(center.X, 0, center.Z) + right * lateral
+    local minimum, maximum = math.huge, -math.huge
+    local roof = -math.huge
+    for _, item in ipairs(stores) do
+        local model, zone = item.Model, item.Zone
+        local cf, size
+        if model:IsA("Model") then
+            local ok, boxCF, boxSize = pcall(function()
+                return model:GetBoundingBox()
+            end)
+            if ok then cf, size = boxCF, boxSize end
+        end
+        if not cf then cf, size = zone.CFrame, zone.Size end
+        local half = size * 0.5
+        local offset = (cf.Position - lane):Dot(forward)
+        local radius = math.abs(cf.RightVector:Dot(forward)) * half.X
+            + math.abs(cf.UpVector:Dot(forward)) * half.Y
+            + math.abs(cf.LookVector:Dot(forward)) * half.Z
+        minimum = math.min(minimum, offset - radius)
+        maximum = math.max(maximum, offset + radius)
+        local explicitRoof, broadTop = -math.huge, -math.huge
+        for _, part in ipairs(model:GetDescendants()) do
+            if part:IsA("BasePart") and part ~= zone then
+                local h, pcf = part.Size * 0.5, part.CFrame
+                local top = part.Position.Y + math.abs(pcf.RightVector.Y)*h.X
+                    + math.abs(pcf.UpVector.Y)*h.Y + math.abs(pcf.LookVector.Y)*h.Z
+                local name = string.lower(part.Name)
+                if name:find("roof",1,true) or name:find("awning",1,true)
+                    or name:find("ceiling",1,true) then
+                    -- Include the non-collidable striped tent/awning visuals.
+                    explicitRoof = math.max(explicitRoof, top)
+                elseif part.CanCollide and part.Size.X * part.Size.Z >= 15 then
+                    broadTop = math.max(broadTop, top)
+                end
+            end
+        end
+        local zh, zcf = zone.Size * 0.5, zone.CFrame
+        local zoneTop = zone.Position.Y + math.abs(zcf.RightVector.Y)*zh.X
+            + math.abs(zcf.UpVector.Y)*zh.Y + math.abs(zcf.LookVector.Y)*zh.Z
+        roof = math.max(roof, zoneTop,
+            explicitRoof > -math.huge and explicitRoof or broadTop)
+    end
+    if minimum >= maximum or roof == -math.huge then return nil end
+    return {Lane=lane, Forward=forward, Min=minimum, Max=maximum, Roof=roof}
+end
 
-    self.Navigation.LastResult = "Crossing shop rooftops"
-    ok, why = self:TweenWaypoint(crossingGround,
-        Enum.PathWaypointAction.Walk, token, 1.25)
-    if not ok then return false, "roof crossing: " .. tostring(why) end
+function P:GetSpawnShopCorridorPlan(fromRoot, toRoot, allowedZone)
+    if allowedZone or not self.Settings.AvoidUnwantedShops then return nil end
+    local route = self:GetSpawnShopCorridor()
+    if not route then return nil end
+    local startAlong = (fromRoot - route.Lane):Dot(route.Forward)
+    local endAlong = (toRoot - route.Lane):Dot(route.Forward)
+    local outbound = endAlong > route.Max+9
+        and startAlong < route.Max+7 and startAlong > route.Min-95
+        and endAlong > startAlong+14
+    local inbound = startAlong > route.Max+9 and endAlong < route.Max+5
+        and endAlong > route.Min-95 and startAlong > endAlong+14
+    if not outbound and not inbound then return nil end
+    route.TakeoffAlong = math.clamp(startAlong, route.Min-18, route.Max+18)
+    route.LandingAlong = outbound and route.Max+14
+        or math.clamp(endAlong, route.Min-16, route.Max-4)
+    return route
+end
 
-    -- No descent speed cap: the previous 155-stud cap and retry loop could
-    -- leave the character appearing suspended above the shop for seconds.
-    self.Navigation.LastResult = "Landing immediately after shops"
-    ok, why = self:TweenWaypoint(afterGround,
-        Enum.PathWaypointAction.Walk, token, 2.0)
-    if not ok then return false, "landing: " .. tostring(why) end
-    self.Navigation.SkyTravel = false
-    return true, "shop cluster cleared"
+function P:ApproachSpawnCenter(surface, token)
+    local _, humanoid, root = self:GetCharacter()
+    if not root or not humanoid then return false, "character" end
+    -- Recover from an earlier failed move leaving the avatar inside a menu ring.
+    for _, entry in ipairs(self:GetMenuTriggerZones()) do
+        if self:IsWithinMenuZone(root.Position, entry.Part, 0) then
+            self.Navigation.LastResult = "Escaping shop before center ascent"
+            if not self:ExitOccupiedMenuZone(token) then
+                return false, "cannot exit occupied shop"
+            end
+            _, humanoid, root = self:GetCharacter()
+            if not root or not humanoid then return false, "character" end
+            break
+        end
+    end
+    local target = self:GetTweenRootTarget(surface, humanoid, root)
+    if not target then return false, "goal" end
+    if (root.Position-target).Magnitude <= 3 then return true end
+    local ok, why = self:TweenWaypoint(surface,
+        Enum.PathWaypointAction.Walk, token, 2.25)
+    if ok then return true end
+    -- Physical stalls may obstruct the lateral approach to the center aisle.
+    -- Pathfind only this grounded approach; no blind CFrame snap.
+    local path = self.S.PathfindingService:CreatePath({
+        AgentRadius=2, AgentHeight=5, AgentCanJump=true, WaypointSpacing=7,
+    })
+    local computed = pcall(function() path:ComputeAsync(root.Position, surface) end)
+    if not computed or path.Status ~= Enum.PathStatus.Success then
+        return false, "center approach: "..tostring(why)
+    end
+    local points = path:GetWaypoints()
+    for index=2,#points do
+        if not self:IsWalkTokenActive(token) then return false,"cancelled" end
+        local point=points[index]
+        local reached,reason=self:TweenWaypoint(point.Position,point.Action,
+            token,index==#points and 2.25 or 1.5)
+        if not reached then return false,"center path: "..tostring(reason) end
+    end
+    return true
+end
+
+-- Rise from the central spawn walkway, cross ABOVE the four stalls, then
+-- promptly land beyond them and continue normal route to the requested stage.
+function P:FlyOverMenuZones(groundDestination, token, allowedZone, acceptance, predicate)
+    local _,humanoid,root=self:GetCharacter()
+    if not humanoid or not root or humanoid.Health<=0 then return false,"character" end
+    local targetRoot=self:GetTweenRootTarget(groundDestination,humanoid,root)
+    if not targetRoot then return false,"goal" end
+    local plan=self:GetSpawnShopCorridorPlan(root.Position,targetRoot,allowedZone)
+    if not plan then return false,"no central shop crossing needed" end
+    local entry=plan.Lane+plan.Forward*plan.TakeoffAlong
+    local landing=plan.Lane+plan.Forward*plan.LandingAlong
+    local floorY=root.Position.Y-self:GetRootGroundOffset(humanoid,root)
+    local entryGround=self:ProjectToGround(Vector3.new(entry.X,floorY,entry.Z))
+    local landingGround=self:ProjectToGround(Vector3.new(landing.X,floorY,landing.Z))
+    if not entryGround or not landingGround then return false,"no corridor ground" end
+    local entryRoot=self:GetTweenRootTarget(entryGround,humanoid,root)
+    local landingRoot=self:GetTweenRootTarget(landingGround,humanoid,root)
+    if self:DestinationHitsMenuZone(entryRoot)
+        or self:DestinationHitsMenuZone(landingRoot) then
+        return false,"corridor endpoint overlaps shop"
+    end
+    self.Navigation.SkyTravel=true
+    self.Navigation.SkyAscent=false
+    self.Navigation.LastResult="Moving to spawn center aisle"
+    local ok,why=self:ApproachSpawnCenter(entryGround,token)
+    if not ok then return false,why end
+    _,humanoid,root=self:GetCharacter()
+    if not humanoid or not root then return false,"character" end
+    local offset=self:GetRootGroundOffset(humanoid,root)
+    local roofY=math.max(plan.Roof+offset+5,root.Position.Y+3,landingRoot.Y+3)
+    local up=Vector3.new(root.Position.X,roofY-offset,root.Position.Z)
+    local crossing=Vector3.new(landingRoot.X,roofY-offset,landingRoot.Z)
+    self.Navigation.SkyAscent=true
+    self.Navigation.LastResult="Going up over shop roofs from spawn center"
+    ok,why=self:TweenWaypoint(up,Enum.PathWaypointAction.Walk,token,1.75)
+    self.Navigation.SkyAscent=false
+    if not ok then return false,"center ascent: "..tostring(why) end
+    self.Navigation.LastResult="Crossing sky over central walkway toward stages"
+    ok,why=self:TweenWaypoint(crossing,Enum.PathWaypointAction.Walk,token,1.75)
+    if not ok then return false,"center crossing: "..tostring(why) end
+    self.Navigation.LastResult="Landing just after shops"
+    ok,why=self:TweenWaypoint(landingGround,Enum.PathWaypointAction.Walk,token,2.25)
+    if not ok then return false,"center descent: "..tostring(why) end
+    self.Navigation.SkyTravel=false
+    return true,"spawn center shop corridor cleared"
 end
 
 function P:IsTweenLineClear(fromSurface, toSurface, extraExclude)
@@ -1449,15 +1549,12 @@ function P:WalkToPosition(goalPosition, options)
         self.Navigation.Repaths = attempt - 1
         local projectedRoot = self:GetTweenRootTarget(projected, humanoid, root)
         local distance = projectedRoot and (root.Position - projectedRoot).Magnitude or 0
-        local crossesShop = projectedRoot and self:RouteCrossesMenuZone(
-            root.Position, projectedRoot, options.AllowedShopZone, 8
-        )
-        -- No shop in the way => never gain altitude. Unlike v1.7.6, long
-        -- distances alone do not trigger sky travel.
-        local shopWindow = crossesShop and projectedRoot and self:GetNextShopHopWindow(
+        -- The center route is chosen for travel from spawn past the four
+        -- stalls toward stages, even when no invisible ring intersects the line.
+        local shopWindow = projectedRoot and self:GetSpawnShopCorridorPlan(
             root.Position, projectedRoot, options.AllowedShopZone
         )
-        if self.Settings.AvoidUnwantedShops and shopWindow then
+        if shopWindow then
             local moved, reason = self:FlyOverMenuZones(
                 projected, token, options.AllowedShopZone, acceptance, arrivalPredicate
             )
@@ -1481,9 +1578,9 @@ function P:WalkToPosition(goalPosition, options)
                 -- repeating a sky trip over the rest of the map.
                 continue
             end
-            -- Fail promptly and restore body physics. Repeated airborne route
-            -- retries were the source of multi-second suspended motion.
-            return finish(false, "Safe shop hop failed: " .. tostring(reason))
+            -- Fail safely instead of hanging airborne on repeated attempts.
+            self.LastError = "Central shop corridor: " .. tostring(reason)
+            return finish(false, self.LastError)
         end
 
         self.Navigation.LastResult = attempt == 1
