@@ -1,4 +1,43 @@
+--[[
+    PuckAFK - +1 Lift Rock for Treasure
+    Smart AutoFarm v1.7.0 - UPD New Stages + Best Loot
 
+    Built from the supplied place dump + captured remote trace for place 102555956950143.
+
+    Core game mechanics accounted for:
+      * 30/s training tap token bucket (script defaults below the cap, with headroom for lift taps)
+      * Rebirth-gated training stations and their real multipliers
+      * Updated sequential rock stages (1 -> 18; 300T / 1Qa / 5Qa late-game stones)
+      * Server/zone-driven lifting; no fake "Start" remote
+      * Rock lift rate ~= Strength / Stone Weight
+      * Stage reward retention until banking
+      * SpawnZone banking resets the stage run
+      * Backpack capacity
+      * Always sort live treasures by the game's rarity ranks, including Ethereal / Exclusive
+      * Visual-ground/live-server reconciliation, stale-UUID protection and per-pick re-ranking
+      * Index discovery priority only INSIDE a rarity tier, never above genuinely rarer treasure
+      * Special timed stage spawns
+      * Sellable/protected item rules
+      * Place Best Luck plot action
+      * Arms unlock/equip progression, including owned Robux arms without purchasing Robux items
+      * Backpack / move-speed upgrades with budget-aware spending
+      * Plot expansion gates/costs
+      * Rebirth level requirements
+      * Offline reward + group reward claiming
+      * Tutorial steps 1-5
+      * Death / reset / stalled lift recovery
+      * Game-native StoneIncome ROI model blended with live-run limits
+      * Snapshot progress recovery and stale special-spawn removal
+      * Instant teleport travel to lift / training / sell / arms / upgrades / plot targets
+      * Mid-run/reload recovery without prematurely banking a partially filled backpack
+      * Authoritative special-spawn snapshot rebuild with revision-safe delta handling
+      * Requirement-aware progression purchases that bypass optional budgets when actually needed
+      * Automatic cash/power milestone planning for backpack, arms, rebirths and training unlocks
+      * PuckUI v3 shared interface loaded from the canonical PuckAFK/Puck-Loader source
+
+    The server is still authoritative: remotes are called with the same argument shapes used by the game,
+    lifting is started by physically entering LiftZone, and pickups are done from the real ItemSpawn slots.
+]]
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
@@ -36,7 +75,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.6.1",
+    Version = "1.7.0",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -60,6 +99,7 @@ local P = {
         LastReset = 0,
         LastBank = 0,
         LastFeedback = 0,
+        PickedUUIDs = {}, -- Prevent stale rendered ground models from being picked twice.
     },
     Route = {
         GameROIStage = 0,
@@ -105,6 +145,7 @@ P.Settings = {
     AutoSpecialSpawns = true,
     IndexPriority = true,
     AdaptiveROI = true,
+    PushNewStages = true,
     AntiAFK = true,
 
     -- Teleport movement. Interactions still use the game's real zones/remotes and verify
@@ -135,6 +176,9 @@ P.Settings = {
 
     -- If the next stage/rebirth is close, train first instead of doing a low-value short run.
     TrainAheadRatio = 1.30,
+    -- Late-game stages have large weight jumps; v1.6.1 never trained past Stage 15.
+    -- Start advancing whenever the next updated stage is within this strength multiple.
+    NewStageTrainRatio = 8,
     RebirthTrainAheadRatio = 1.18,
 
     -- Economy spending budgets. Arms are always first priority when the next arm is affordable.
@@ -736,8 +780,21 @@ function P:GetStage(stageId)
     if not stages then
         return nil
     end
+    stageId = tonumber(stageId)
+    if not stageId then
+        return nil
+    end
+    -- StageId is the authoritative identifier. Name fallback is for instances arriving
+    -- before their attributes in a streaming/replication update.
+    local fallback = stages:FindFirstChild("Stage" .. tostring(stageId))
+    if fallback and fallback:IsA("Model") then
+        local attribute = tonumber(fallback:GetAttribute("StageId"))
+        if not attribute or attribute == stageId then
+            return fallback
+        end
+    end
     for _, stage in ipairs(stages:GetChildren()) do
-        if stage:IsA("Model") and tonumber(stage:GetAttribute("StageId")) == tonumber(stageId) then
+        if stage:IsA("Model") and tonumber(stage:GetAttribute("StageId")) == stageId then
             return stage
         end
     end
@@ -746,21 +803,35 @@ end
 
 function P:GetStageWeight(stageId)
     local stage = self:GetStage(stageId)
-    if not stage then
-        return math.huge
-    end
-    local key = stage:GetAttribute("StoneKey")
-    local config = key and self.M.Config.Stones[key]
+    local key = stage and stage:GetAttribute("StoneKey")
+    -- The game's stage models use Stone16, Stone17 and Stone18, and its live
+    -- ReplicatedStorage.Shared.Data.Stones is more reliable than a stale 15-stage map snapshot.
+    local stones = self.M.Config.Stones or {}
+    local config = stones[key] or stones["Stone" .. tostring(tonumber(stageId) or stageId)]
     return config and tonumber(config.Weight) or math.huge
 end
 
 function P:GetMaxStage()
+    local maxStage = 0
+    -- Treat the live Config.Stones as the supported game stage catalog.
+    -- This automatically detects future additions without shipping a new hard-coded cap.
+    for key, definition in pairs(self.M.Config.Stones or {}) do
+        local id = type(key) == "string" and tonumber(key:match("^Stone(%d+)$")) or nil
+        if id and type(definition) == "table" and tonumber(definition.Weight) then
+            maxStage = math.max(maxStage, id)
+        end
+    end
     local map = self:Map()
     local stages = map and map:FindFirstChild("Stages")
-    local maxStage = 0
     if stages then
         for _, stage in ipairs(stages:GetChildren()) do
-            maxStage = math.max(maxStage, tonumber(stage:GetAttribute("StageId")) or 0)
+            if stage:IsA("Model") then
+                local id = tonumber(stage:GetAttribute("StageId"))
+                    or tonumber(stage.Name:match("^Stage(%d+)$"))
+                if id then
+                    maxStage = math.max(maxStage, id)
+                end
+            end
         end
     end
     return maxStage
@@ -811,6 +882,7 @@ function P:ClearRunState()
     self.Run.Rewards = {}
     self.Run.Progress = {}
     self.Run.Session = nil
+    self.Run.PickedUUIDs = {}
     self.Run.LastReset = os.clock()
 end
 
@@ -1175,15 +1247,17 @@ function P:ChooseTargetStage()
         return 0
     end
 
-    local target = efficient
+    -- v1.6.1 applied the offline StoneIncome ROI estimator as a hard maximum.
+    -- It favors shorter/older rocks and caused a late-game Stage-15 ceiling.
+    -- Keep its economic forecast, but never use it to block an affordable higher stage.
+    -- Sequential stage completion also gives access to rarer treasure on later ground slots.
     local roiStage = self:GetGameROIStage()
-    if self.Settings.AdaptiveROI and roiStage > 0 then
-        -- The game's estimator prices normal travel time and move-speed upgrades.
-        -- Because this build also uses deliberately slow traversal, respect that target directly instead of
-        -- artificially pushing one stage above it as the old teleport route did.
-        target = math.min(efficient, math.max(1, roiStage))
+    local target = efficient
+    if self.Settings.AdaptiveROI and roiStage > 0 and efficient < 15 then
+        -- In earlier zones, respect economy estimates but at most give up one rock.
+        -- Beyond Stage 14, never let the offline model hide the 100T+ content.
+        target = math.max(1, math.min(efficient, math.max(roiStage, efficient - 1)))
     end
-
     target = math.max(target, self:GetSpecialPriorityStage(power))
     return math.clamp(target, 0, self:GetMaxStage())
 end
@@ -1199,13 +1273,22 @@ function P:ChooseTrainingTarget()
     end
 
     local nextStage = target + 1
-    local bestTarget = nil
-    local reason = nil
+    local bestTarget, reason
     if nextStage <= maxStage then
-        local threshold = self:GetStageWeight(nextStage) / math.max(0.1, self.Settings.MaxLiftSeconds)
-        if threshold > power and threshold <= power * self.Settings.TrainAheadRatio then
-            bestTarget = math.ceil(threshold)
-            reason = "Stage " .. tostring(nextStage) .. " efficiency"
+        -- Both per-rock time and cumulative run time are hard conditions in
+        -- HighestEfficientStage. Train for BOTH, not solely the next stone's weight.
+        local individualNeed = self:GetStageWeight(nextStage) / math.max(0.1, self.Settings.MaxLiftSeconds)
+        local totalNeed = self:CumulativeLiftSeconds(nextStage, 1) / math.max(1, self.Settings.MaxRunSeconds)
+        local required = math.ceil(math.max(individualNeed, totalNeed))
+        local ratio = tonumber(self.Settings.TrainAheadRatio) or 1.30
+        if nextStage >= 16 and self.Settings.PushNewStages then
+            -- New UPD rocks rise from 100T to 300T, 1Qa and 5Qa.
+            -- The old 1.3x near-goal rule never trained far enough to unlock them.
+            ratio = math.max(ratio, tonumber(self.Settings.NewStageTrainRatio) or 8)
+        end
+        if required > power and required <= power * ratio then
+            bestTarget = required
+            reason = "Stage " .. tostring(nextStage) .. " (new rock progression)"
         end
     end
 
@@ -1375,6 +1458,12 @@ function P:LiftStage(stageId)
         return false
     end
     local stage = self:GetStage(stageId)
+    if not stage then
+        self:WaitUntil(function()
+            stage = self:GetStage(stageId)
+            return stage ~= nil
+        end, 2.5, 0.1)
+    end
     local zone = stage and stage:FindFirstChild("LiftZone")
     if not stage or not zone then
         self.LastError = "Missing stage/LiftZone for " .. tostring(stageId)
@@ -1488,26 +1577,27 @@ function P:RarityRank(item)
     if ok then
         rarity = result
     end
-    local ranks = {
-        Common = 1,
-        Uncommon = 2,
-        Rare = 3,
-        Epic = 4,
-        Legendary = 5,
-        Mythic = 6,
-        Secret = 7,
-        Celestial = 8,
-        Divine = 9,
-        Exclusive = 10,
-    }
-    return ranks[rarity] or 0, rarity
+    if type(rarity) ~= "string" then
+        rarity = item and item.Rarity
+    end
+    -- Use the game's own Rarities[id] table. UPD added Ethereal (10),
+    -- moving Exclusive to 11; the previous hard-coded list omitted Ethereal.
+    local entry = type(rarity) == "string" and (self.M.Config.Rarities or {})[rarity]
+    local rank = type(entry) == "table" and tonumber(entry.id)
+    if not rank then
+        local fallback = {
+            Common = 1, Uncommon = 2, Rare = 3, Epic = 4,
+            Legendary = 5, Mythic = 6, Secret = 7, Celestial = 8,
+            Divine = 9, Ethereal = 10, Exclusive = 11,
+        }
+        rank = fallback[rarity] or 0
+    end
+    return rank, rarity or "Unknown"
 end
 
 function P:CandidateData(stageId, slot, item, special)
     local rank, rarity = self:RarityRank(item)
-    local price = 0
-    local luck = 0
-    local cashMultiplier = 1
+    local price, luck, cashMultiplier = 0, 0, 1
     local okMulti, multiResult = pcall(self.M.PlayerDataInfo.GetCashMultiplier, self.Player)
     if okMulti then
         cashMultiplier = tonumber(multiResult) or 1
@@ -1527,18 +1617,6 @@ function P:CandidateData(stageId, slot, item, special)
     local indexIncomplete = indexEligible and self:DiscoveryCount(variant) < threshold
     local newDiscovery = self.Settings.IndexPriority and indexIncomplete and not self:IsDiscovered(item)
 
-    -- Rarity remains the dominant signal. Specials and useful index discoveries can beat a nearby
-    -- tier, while sell value/luck break ties and improve long-term plot/cash progression.
-    local priorityScore = rank * 1000000
-    if special == true then
-        priorityScore = priorityScore + 800000
-    end
-    if newDiscovery == true then
-        priorityScore = priorityScore + 1100000
-    end
-    priorityScore = priorityScore + math.min(500000, math.max(0, luck) * 100)
-    priorityScore = priorityScore + math.min(250000, (math.log(math.max(1, price)) / math.log(10)) * 25000)
-
     return {
         StageId = stageId,
         Slot = slot,
@@ -1550,41 +1628,107 @@ function P:CandidateData(stageId, slot, item, special)
         Luck = luck,
         IndexEligible = indexEligible,
         NewDiscovery = newDiscovery == true,
-        PriorityScore = priorityScore,
     }
 end
 
-function P:GetRewardCandidates()
-    local candidates = {}
-    for stageId, reward in pairs(self.Run.Rewards) do
-        if type(reward) == "table" and reward.Completed == true and type(reward.Items) == "table" then
-            local specials = self.Run.Specials[stageId] or {}
-            for slot, baseItem in pairs(reward.Items) do
-                local item = baseItem
-                local isSpecial = false
-                local special = specials[slot]
-                if type(special) == "table" and type(special.Item) == "table" then
-                    item = special.Item
-                    isSpecial = true
-                end
-                if type(item) == "table" and type(item.UUID) == "string" then
-                    table.insert(candidates, self:CandidateData(stageId, slot, item, isSpecial))
+function P:GetVisibleStageItems(stageId)
+    local stage = self:GetStage(stageId)
+    local visible = {}
+    if not stage then
+        return visible
+    end
+    -- Actual treasure models are parented directly to their stage by TreasureVisuals.Update.
+    -- They carry StageId, SpawnSlot and UUID attributes applied by ItemUtils.Spawn.
+    for _, model in ipairs(stage:GetChildren()) do
+        if model:IsA("Model") then
+            local slot = model:GetAttribute("SpawnSlot")
+            local uuid = model:GetAttribute("UUID")
+            if type(slot) == "string" and type(uuid) == "string"
+                and tonumber(model:GetAttribute("StageId")) == tonumber(stageId) then
+                local ok, item = pcall(self.M.ItemUtils.FromInstance, model)
+                if ok and type(item) == "table" and item.UUID == uuid and item.Key ~= nil then
+                    visible[slot] = item
                 end
             end
         end
     end
+    return visible
+end
 
-    table.sort(candidates, function(a, b)
-        if a.PriorityScore ~= b.PriorityScore then
-            return a.PriorityScore > b.PriorityScore
+function P:GetRewardCandidates()
+    local candidates = {}
+    local staged = {}
+    for stageId, reward in pairs(self.Run.Rewards) do
+        if type(reward) == "table" and reward.Completed == true then
+            staged[tonumber(stageId) or stageId] = true
         end
-        if a.Luck ~= b.Luck then
-            return a.Luck > b.Luck
+    end
+    for stageId, isCleared in pairs(self.Run.Cleared) do
+        if isCleared then
+            staged[tonumber(stageId) or stageId] = true
+        end
+    end
+
+    for stageId in pairs(staged) do
+        local reward = self.Run.Rewards[stageId]
+        local items = reward and reward.Items or {}
+        local specials = self.Run.Specials[stageId] or {}
+        local visible = self:GetVisibleStageItems(stageId)
+        local slots = {}
+        for slot in pairs(items) do slots[slot] = true end
+        for slot in pairs(visible) do slots[slot] = true end
+        for slot in pairs(specials) do slots[slot] = true end
+
+        for slot in pairs(slots) do
+            local base = items[slot]
+            local spawned = visible[slot]
+            local event = specials[slot]
+            local specialItem = type(event) == "table" and event.Item or nil
+            local item = nil
+            local isSpecial = false
+
+            if type(specialItem) == "table" and type(specialItem.UUID) == "string" then
+                -- Live server special spawns override the ordinary slot item.
+                item = specialItem
+                isSpecial = true
+            elseif type(spawned) == "table" then
+                -- Real ground UUID wins over a lagged ordinary snapshot.
+                item = spawned
+                isSpecial = spawned.SpecialSpawnId ~= nil
+            elseif type(base) == "table" and base.SpecialSpawnId == nil then
+                -- Client TreasureVisuals discards orphaned SpecialSpawnId slots.
+                item = base
+            end
+
+            if type(item) == "table" and type(item.UUID) == "string"
+                and not self.Run.PickedUUIDs[item.UUID] then
+                table.insert(candidates, self:CandidateData(stageId, slot, item, isSpecial))
+            end
+        end
+    end
+
+    -- STRICT ordering: a rarer tier ALWAYS outranks every lower tier,
+    -- regardless of index discovery, special events, sell price or luck.
+    table.sort(candidates, function(a, b)
+        if a.RarityRank ~= b.RarityRank then
+            return a.RarityRank > b.RarityRank
         end
         if a.Price ~= b.Price then
             return a.Price > b.Price
         end
-        return a.StageId > b.StageId
+        if a.Luck ~= b.Luck then
+            return a.Luck > b.Luck
+        end
+        if a.NewDiscovery ~= b.NewDiscovery then
+            return a.NewDiscovery
+        end
+        if a.Special ~= b.Special then
+            return a.Special
+        end
+        if a.StageId ~= b.StageId then
+            return a.StageId > b.StageId
+        end
+        return tostring(a.Slot) < tostring(b.Slot)
     end)
     return candidates
 end
@@ -1600,33 +1744,49 @@ function P:CollectCandidate(candidate)
         return false
     end
 
-    self:SetStatus(
-        string.format("Teleporting to %s%s at Stage %d", candidate.NewDiscovery and "NEW " or "", tostring(candidate.Item.Key), candidate.StageId),
-        "TP"
-    )
-    if not self:WalkToObject(spawnPart, 4.5) then
-        self.LastError = "Could not teleport to treasure slot " .. tostring(candidate.Slot) .. " at Stage " .. tostring(candidate.StageId)
+    -- Abort immediately if something better appeared between selection and travel.
+    local currentBest = self:GetRewardCandidates()[1]
+    if currentBest and currentBest.Item.UUID ~= candidate.Item.UUID then
         return false
     end
 
     self:SetStatus(
-        string.format("Collecting %s%s from Stage %d", candidate.NewDiscovery and "NEW " or "", tostring(candidate.Item.Key), candidate.StageId),
+        string.format("Collecting %s %s at Stage %d", tostring(candidate.Rarity), tostring(candidate.Item.Key), candidate.StageId),
         "COLLECT"
     )
-    task.wait(0.08)
+    if not self:WalkToObject(spawnPart, 4.5) then
+        self.LastError = "Could not reach treasure slot " .. tostring(candidate.Slot) .. " at Stage " .. tostring(candidate.StageId)
+        return false
+    end
+
+    -- Do not send a stale slot/UUID after a ground item changes during travel.
+    -- World models may still be loading, so corroborate with the live candidate source.
+    local refreshed = self:GetRewardCandidates()[1]
+    if not refreshed or refreshed.Item.UUID ~= candidate.Item.UUID then
+        return false
+    end
+    local visible = self:GetVisibleStageItems(candidate.StageId)[candidate.Slot]
+    local special = (self.Run.Specials[candidate.StageId] or {})[candidate.Slot]
+    if visible and visible.UUID ~= candidate.Item.UUID
+        and not (type(special) == "table" and type(special.Item) == "table"
+            and special.Item.UUID == candidate.Item.UUID) then
+        return false
+    end
 
     local before = self:BackpackCount()
     local ok, success = pcall(function()
         return self.R.PickupStageTreasure:InvokeServer(candidate.StageId, candidate.Slot, candidate.Item.UUID)
     end)
     if ok and success then
+        self.Run.PickedUUIDs[candidate.Item.UUID] = true
         local reward = self.Run.Rewards[candidate.StageId]
-        if reward and reward.Items then
+        if reward and reward.Items and type(reward.Items[candidate.Slot]) == "table"
+            and reward.Items[candidate.Slot].UUID == candidate.Item.UUID then
             reward.Items[candidate.Slot] = nil
         end
         self:WaitUntil(function()
             return self:BackpackCount() > before or self:BackpackCount() >= self:BackpackCapacity()
-        end, 0.7, 0.03)
+        end, 0.8, 0.03)
         return true
     end
     return false
@@ -1643,26 +1803,43 @@ function P:CollectBestRewards(limit)
         return 0
     end
 
-    local candidates = self:GetRewardCandidates()
-    if #candidates == 0 and self:HighestCleared() > 0 then
+    if #self:GetRewardCandidates() == 0 and self:HighestCleared() > 0 then
         pcall(function()
             self.R.RockLiftingInput:FireServer("Sync")
         end)
-        task.wait(0.6)
-        candidates = self:GetRewardCandidates()
+        task.wait(0.55)
     end
 
-    local collected = 0
-    for _, candidate in ipairs(candidates) do
-        if not self.Alive or not self.Settings.Enabled or collected >= remaining then
+    local collected, failures = 0, 0
+    while self.Alive and self.Settings.Enabled and collected < remaining
+        and self:BackpackCount() < capacity do
+        -- Re-query the real displayed models + current server specials after EVERY pickup.
+        -- A single precomputed list becomes wrong as timed rarity spawns or items change.
+        local best = self:GetRewardCandidates()[1]
+        if not best then
             break
         end
-        if self:BackpackCount() >= capacity then
-            break
-        end
-        if self:CollectCandidate(candidate) then
-            collected = collected + 1
-            task.wait(0.04)
+        if self:CollectCandidate(best) then
+            collected += 1
+            failures = 0
+            task.wait(0.05)
+        else
+            failures += 1
+            if failures == 1 then
+                pcall(function()
+                    self.R.RockLiftingInput:FireServer("Sync")
+                end)
+                self:RefreshSpecialSpawns(true)
+                task.wait(0.35)
+            elseif failures >= 3 then
+                -- Never silently collect inferior rarity while the visible/best one
+                -- repeatedly fails. Leave this run intact for another synchronized pass.
+                self.LastError = "Best treasure pickup needs retry: " .. tostring(best.Rarity)
+                    .. " " .. tostring(best.Item.Key)
+                break
+            else
+                task.wait(0.15)
+            end
         end
     end
     return collected
@@ -2430,6 +2607,13 @@ function P:RunProgressionCycle()
         local collected = self:CollectBestRewards(self:BackpackCapacity())
 
         if self.Settings.AutoBank then
+            -- Only bank early if no better treasure remains or the backpack is full;
+            -- otherwise a transient pickup failure would irreversibly discard the rarest item.
+            if self:BackpackCount() < self:BackpackCapacity() and #self:GetRewardCandidates() > 0 then
+                self:SetStatus("Retrying the best remaining treasure before banking...", "RECOVER")
+                task.wait(0.50)
+                return
+            end
             if self:BackpackCount() > 0 then
                 if not self:BankRun() then
                     self:SetStatus("Bank retry needed; retaining the current run", "RECOVER")
@@ -2663,7 +2847,7 @@ function P:CreateUI()
     local progressCard = home:CreateParagraph({
         Title = "Progress",
         Content = "Loading your progress...",
-        Height = 76,
+        Height = 94,
     })
     local goalCard = home:CreateParagraph({
         Title = "Next Goal",
@@ -2684,6 +2868,7 @@ function P:CreateUI()
 
     farm:CreateSection("Smart Choices")
     bindToggle(farm, "Smart Stage Selection", "AdaptiveROI")
+    bindToggle(farm, "Push New Rock Stages", "PushNewStages")
     bindToggle(farm, "Prioritize New Treasures", "IndexPriority")
     bindSlider(farm, "Training Speed", "TapRate", {5, 29}, 1, "/s")
 
@@ -2729,13 +2914,15 @@ function P:CreateUI()
             progressCard:Set({
                 Title = "Progress",
                 Content = string.format(
-                    "Strength %s   •   Cash $%s\nRebirths %s   •   Arm x%s   •   Backpack %d/%d",
+                    "Strength %s   •   Cash $%s\nRebirths %s   •   Arm x%s   •   Backpack %d/%d\nRock Target %d / %d",
                     self:Compact(data.Power or 0),
                     self:Compact(data.Cash or 0),
                     self:Compact(data.Rebirths or 0),
                     self:Compact(armMulti or 1),
                     self:BackpackCount(),
-                    self:BackpackCapacity()
+                    self:BackpackCapacity(),
+                    math.min(self.TargetStage or 1, self:GetMaxStage()),
+                    self:GetMaxStage()
                 ),
             })
 
