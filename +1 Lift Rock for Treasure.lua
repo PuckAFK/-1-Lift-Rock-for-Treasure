@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.9.0 - Instant Safe Teleport + Anti-Fling
+    Smart AutoFarm v1.9.1 - Individual Luck + Mutation-Safe Pickup
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.9.0",
+    Version = "1.9.1",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -2123,32 +2123,65 @@ function P:PickupAllowed(candidate)
 end
 
 function P:CandidateData(stageId, slot, item, special)
-    local rank, rarity = self:RarityRank(item)
-    local price, luck, cashMultiplier = 0, 0, 1
+    -- Stage snapshots can omit ItemType. Restore the known type for the
+    -- game's native per-item luck and sell-value calculations.
+    local actual = item
+    if actual.ItemType == nil then
+        actual = table.clone(item)
+        actual.ItemType = "Treasure"
+    end
+    local rank, rarity = self:RarityRank(actual)
+    local treasureConfig = self.M.Config.Treasures or {}
+    local key = (treasureConfig.KeyAliases or {})[actual.Key] or actual.Key
+    local definition = (treasureConfig.Items or {})[key] or {}
+    local variant = actual.Variant or "Normal"
+    local mutation = tonumber(((self.M.Config.Variants or {})[variant] or {}).MutationMulti) or 1
+    if mutation ~= mutation or mutation <= 0 then mutation = 1 end
+
+    local cashMultiplier = 1
     local okMulti, multiResult = pcall(self.M.PlayerDataInfo.GetCashMultiplier, self.Player)
-    if okMulti then
-        cashMultiplier = tonumber(multiResult) or 1
+    if okMulti then cashMultiplier = tonumber(multiResult) or 1 end
+    local price = 0
+    local okPrice, priceResult = pcall(self.M.ItemUtils.GetSellPrice, actual, cashMultiplier)
+    if okPrice and type(priceResult) == "number" and priceResult == priceResult then
+        price = math.max(0, priceResult)
     end
-    local okPrice, priceResult = pcall(self.M.ItemUtils.GetSellPrice, item, cashMultiplier)
-    if okPrice then
-        price = tonumber(priceResult) or 0
-    end
-    local okDisplay, display = pcall(self.M.ItemUtils.GetAllDisplayData, item)
-    if okDisplay and type(display) == "table" then
-        luck = tonumber(display.LuckBonus) or 0
+    if price <= 0 then
+        price = math.max(0, tonumber(actual.BestValue)
+            or (tonumber(definition.Price or definition.Value) or 0) * mutation) * math.max(0, cashMultiplier)
     end
 
-    local variant = item.Variant or "Normal"
+    -- CollectableItem.GetAllDisplayData uses base LuckBonus * MutationMulti,
+    -- with best-owned values and StarLevel included when applicable.
+    local stars = math.max(0, tonumber(actual.StarLevel) or 0)
+    local fuse = self.M.Config.FuseMaschine or {}
+    local fusedRarity = (fuse.Rarities or {})[rarity]
+    local starMulti = 1
+    if stars > 0 and type(fusedRarity) == "table" then
+        starMulti = 1 + ((tonumber(fusedRarity.Multiplier) or 1) - 1) * stars
+    end
+    local luck = (tonumber(actual.BestLuckBonus)
+        or (tonumber(definition.LuckBonus) or 0) * mutation) * starMulti
+    local okDisplay, display = pcall(self.M.ItemUtils.GetAllDisplayData, actual)
+    if okDisplay and type(display) == "table" then
+        local preciseLuck = tonumber(display.LuckBonus)
+        if preciseLuck and preciseLuck == preciseLuck and preciseLuck >= 0 then
+            luck = preciseLuck
+        end
+    end
+
     local threshold = tonumber(self.M.Config.Index and self.M.Config.Index.Threshold) or 60
     local indexEligible = self:VariantCountsForIndex(variant)
     local indexIncomplete = indexEligible and self:DiscoveryCount(variant) < threshold
-    local newDiscovery = self.Settings.IndexPriority and indexIncomplete and not self:IsDiscovered(item)
+    local newDiscovery = self.Settings.IndexPriority and indexIncomplete and not self:IsDiscovered(actual)
 
     return {
         StageId = stageId,
         Slot = slot,
-        Item = item,
+        Item = actual,
         Special = special == true,
+        Variant = variant,
+        MutationMultiplier = mutation,
         Rarity = rarity,
         RarityRank = rank,
         Price = price,
@@ -2258,27 +2291,18 @@ function P:GetRewardCandidates()
         end
     end
 
-    -- STRICT ordering: a rarer tier ALWAYS outranks every lower tier,
-    -- regardless of index discovery, special events, sell price or luck.
+    -- Individual bonus is the top priority; rarity, mutation and price are
+    -- tiebreakers only. The minimum-rarity setting remains a hard filter.
     table.sort(candidates, function(a, b)
-        if a.RarityRank ~= b.RarityRank then
-            return a.RarityRank > b.RarityRank
+        if a.Luck ~= b.Luck then return a.Luck > b.Luck end
+        if a.RarityRank ~= b.RarityRank then return a.RarityRank > b.RarityRank end
+        if a.MutationMultiplier ~= b.MutationMultiplier then
+            return a.MutationMultiplier > b.MutationMultiplier
         end
-        if a.Price ~= b.Price then
-            return a.Price > b.Price
-        end
-        if a.Luck ~= b.Luck then
-            return a.Luck > b.Luck
-        end
-        if a.NewDiscovery ~= b.NewDiscovery then
-            return a.NewDiscovery
-        end
-        if a.Special ~= b.Special then
-            return a.Special
-        end
-        if a.StageId ~= b.StageId then
-            return a.StageId > b.StageId
-        end
+        if a.Price ~= b.Price then return a.Price > b.Price end
+        if a.Special ~= b.Special then return a.Special end
+        if a.NewDiscovery ~= b.NewDiscovery then return a.NewDiscovery end
+        if a.StageId ~= b.StageId then return a.StageId > b.StageId end
         return tostring(a.Slot) < tostring(b.Slot)
     end)
     return candidates
@@ -2302,7 +2326,10 @@ function P:CollectCandidate(candidate)
     end
 
     self:SetStatus(
-        string.format("Collecting %s %s at Stage %d", tostring(candidate.Rarity), tostring(candidate.Item.Key), candidate.StageId),
+        string.format("Collecting %s %s %s (+%.1f%% Luck) at Stage %d",
+            candidate.Variant ~= "Normal" and tostring(candidate.Variant) or "",
+            tostring(candidate.Rarity), tostring(candidate.Item.Key),
+            (tonumber(candidate.Luck) or 0) * 100, candidate.StageId),
         "COLLECT"
     )
     if not self:WalkToObject(spawnPart, 4.5) then
@@ -2317,10 +2344,9 @@ function P:CollectCandidate(candidate)
         return false
     end
     local visible = self:GetVisibleStageItems(candidate.StageId)[candidate.Slot]
-    local special = (self.Run.Specials[candidate.StageId] or {})[candidate.Slot]
-    if visible and visible.UUID ~= candidate.Item.UUID
-        and not (type(special) == "table" and type(special.Item) == "table"
-            and special.Item.UUID == candidate.Item.UUID) then
+    -- A stale special-spawn snapshot must never override a different
+    -- on-ground UUID. Recheck after TreasureVisuals reconciles the slot.
+    if visible and visible.UUID ~= candidate.Item.UUID then
         return false
     end
 
