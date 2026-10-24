@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.9.3 - Random Mutation Priority + Reserved Pickup Slot
+    Smart AutoFarm v1.9.4 - Rainbow Retention + Full Backpack + Quiet Debug
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.9.3",
+    Version = "1.9.4",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -344,14 +344,25 @@ function P:SetStatus(text, phase)
     local newStatus = tostring(text or "")
     local newPhase = phase or self.Phase
     local debug = self.Debug
-    if debug and (newPhase ~= self.Phase or newStatus ~= self.Status)
-        and (newPhase ~= debug.LastStatusPhase
-            or newStatus ~= debug.LastStatus
-            or os.clock() - (debug.LastStatusTime or 0) > 1.6) then
-        debug.LastStatus = newStatus
-        debug.LastStatusPhase = newPhase
-        debug.LastStatusTime = os.clock()
-        self:DebugEvent("STATE", tostring(newPhase).." :: "..newStatus)
+    if debug then
+        -- Lift estimates fluctuate every fraction of a second. Keep the Home
+        -- card up to date, but write a log only on stage change / every 6 sec.
+        local key = newStatus
+        local interval = 1.6
+        if newPhase == "LIFT" then
+            key = newStatus:match("^(Lifting Stage %d+)") or newStatus
+            interval = 6
+        end
+        local now = os.clock()
+        if newPhase ~= debug.LastStatusPhase or key ~= debug.LastStatusKey
+            or (now - (debug.LastStatusTime or 0) >= interval
+                and newStatus ~= debug.LastStatus) then
+            debug.LastStatus = newStatus
+            debug.LastStatusKey = key
+            debug.LastStatusPhase = newPhase
+            debug.LastStatusTime = now
+            self:DebugEvent("STATE", tostring(newPhase).." :: "..newStatus)
+        end
     end
     self.Status = newStatus
     if phase then self.Phase = phase end
@@ -2478,6 +2489,12 @@ function P:CollectCandidate(candidate)
     end)
     if ok and success then
         self.Run.PickedUUIDs[candidate.Item.UUID] = true
+        if candidate.TopMutation then
+            self:DebugEvent("MUTATION", string.format(
+                "SERVER ACCEPTED top mutation pickup: %s %s (+%.1f%% Luck), Stage %d",
+                tostring(candidate.Variant), tostring(candidate.Item.Key),
+                (tonumber(candidate.Luck) or 0) * 100, candidate.StageId))
+        end
         local reward = self.Run.Rewards[candidate.StageId]
         if reward and reward.Items and type(reward.Items[candidate.Slot]) == "table"
             and reward.Items[candidate.Slot].UUID == candidate.Item.UUID then
@@ -2519,7 +2536,7 @@ function P:CollectBestRewards(limit)
             break
         end
         if not self:CanCollectMoreRewards() then
-            self:DebugEvent("MUTATION", "Reserved last backpack slot for random top mutation")
+            self:DebugEvent("MUTATION", "Holding last slot until final mutation check")
             break
         end
         if self:CollectCandidate(best) then
@@ -2584,6 +2601,28 @@ function P:ExitSpawnForBankRetry(zone)
     return self:WalkOutOfZone(zone,8)
 end
 
+function P:FinishReservedPickupSlot()
+    if not self.Settings.AutoCollect or not self.Settings.ProtectTopMutation then return end
+    local capacity = self:BackpackCapacity()
+    if capacity <= 1 or self:BackpackCount() ~= capacity - 1 then return end
+
+    -- The previous script stopped at 7/8 and banked immediately, wasting
+    -- the spare space. Perform one final random-spawn check before ending
+    -- the run, then fill that last slot with the top remaining reward.
+    task.wait(0.22)
+    self:RefreshSpecialSpawns(true)
+    local candidate = self:GetRewardCandidates()[1]
+    if not candidate then return end
+    if candidate.TopMutation then
+        self:DebugEvent("MUTATION", "Emergency slot used for top random mutation")
+    else
+        self:DebugEvent("MUTATION", "No top mutation; filling reserved slot with best remaining luck")
+    end
+    if not self:CollectCandidate(candidate) and candidate.TopMutation then
+        self:DebugEvent("MUTATION", "Top mutation pickup needs retry; bank protection remains active")
+    end
+end
+
 function P:BankRun()
     if not self.Settings.AutoBank then return false end
     -- Entering SpawnZone destroys every still-uncollected stage reward.
@@ -2645,22 +2684,31 @@ function P:BankRun()
 end
 
 function P:SellableInventory()
-    local result = {}
-    local seen = {}
+    local result, seen = {}, {}
+    local protected = 0
     local inventory = self:Data().Inventory
-    if type(inventory) ~= "table" then
-        return result
-    end
+    if type(inventory) ~= "table" then return result end
     for _, item in pairs(inventory) do
         if type(item) == "table" then
-            local uuid = type(item.UUID) == "string" and item.UUID or tostring(item)
-            local ok, sellable = pcall(self.M.ItemUtils.IsSellable, item)
-            if ok and sellable == true and not seen[uuid] then
-                seen[uuid] = true
-                table.insert(result, item)
+            -- Protect rare Rainbow/event mutations even when the plot's
+            -- Best Luck command prefers a higher-base-luck normal item.
+            if self.Settings.ProtectTopMutation and self:IsTopMutation(item) then
+                protected += 1
+            else
+                local uuid = type(item.UUID) == "string" and item.UUID or tostring(item)
+                local ok, sellable = pcall(self.M.ItemUtils.IsSellable, item)
+                if ok and sellable == true and not seen[uuid] then
+                    seen[uuid] = true
+                    table.insert(result, item)
+                end
             end
         end
     end
+    if protected > 0 and protected ~= self.Debug.LastProtectedMutationCount then
+        self:DebugEvent("MUTATION", "Preserving "..tostring(protected)
+            .." top-mutation item(s); excluded from SellItems")
+    end
+    self.Debug.LastProtectedMutationCount = protected
     return result
 end
 
@@ -3422,6 +3470,7 @@ function P:RunProgressionCycle()
         end
 
         if self.Settings.AutoBank then
+            self:FinishReservedPickupSlot()
             -- Only bank early if no better treasure remains or the backpack is full;
             -- otherwise a transient pickup failure would irreversibly discard the rarest item.
             if self:CanCollectMoreRewards() then
@@ -3689,7 +3738,7 @@ function P:CreateUI()
     farm:CreateParagraph({
         Title = "Random Mutation Protection",
         Content = "Detects the strongest live mutation, interrupts farming and checks before banking. "
-            .. "Reserves one backpack slot; best mutation bypasses Minimum Rarity.",
+            .. "Checks the last slot before resetting; never auto-sells the strongest mutation.",
         Height = 68,
     })
 
