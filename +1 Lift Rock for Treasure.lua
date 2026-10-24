@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.9.2 - Live Random Mutation Guard + Safe Rerolls
+    Smart AutoFarm v1.9.3 - Random Mutation Priority + Reserved Pickup Slot
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.9.2",
+    Version = "1.9.3",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -2375,6 +2375,20 @@ function P:GetRewardCandidates()
     return candidates
 end
 
+function P:CanCollectMoreRewards()
+    local available = self:BackpackCapacity() - self:BackpackCount()
+    if available <= 0 then return false end
+    local best = self:GetRewardCandidates()[1]
+    if not best then return false end
+    -- Keep one emergency slot free for a high-value random mutation.
+    -- We still fill that final slot immediately when a protected mutation appears.
+    if self.Settings.ProtectTopMutation and self:BackpackCapacity() > 1
+        and available <= 1 and not best.TopMutation then
+        return false
+    end
+    return true
+end
+
 function P:GetUrgentMutation(force)
     if not self.Settings.ProtectTopMutation or not self.Settings.AutoCollect then
         return nil
@@ -2502,6 +2516,10 @@ function P:CollectBestRewards(limit)
         -- A single precomputed list becomes wrong as timed rarity spawns or items change.
         local best = self:GetRewardCandidates()[1]
         if not best then
+            break
+        end
+        if not self:CanCollectMoreRewards() then
+            self:DebugEvent("MUTATION", "Reserved last backpack slot for random top mutation")
             break
         end
         if self:CollectCandidate(best) then
@@ -3406,7 +3424,7 @@ function P:RunProgressionCycle()
         if self.Settings.AutoBank then
             -- Only bank early if no better treasure remains or the backpack is full;
             -- otherwise a transient pickup failure would irreversibly discard the rarest item.
-            if self:BackpackCount() < self:BackpackCapacity() and #self:GetRewardCandidates() > 0 then
+            if self:CanCollectMoreRewards() then
                 self:SetStatus("Retrying the best remaining treasure before banking...", "RECOVER")
                 task.wait(0.50)
                 return
@@ -3417,7 +3435,7 @@ function P:RunProgressionCycle()
                     task.wait(0.4)
                     return
                 end
-            elseif #self:GetRewardCandidates() > 0 then
+            elseif self:CanCollectMoreRewards() then
                 -- Do not enter SpawnZone and erase a run when pickup failed transiently.
                 self:SetStatus("Pickup did not confirm; retaining rewards and retrying instead of resetting", "RECOVER")
                 pcall(function()
@@ -3670,8 +3688,8 @@ function P:CreateUI()
     bindToggle(farm, "Never Skip Best Mutation", "ProtectTopMutation")
     farm:CreateParagraph({
         Title = "Random Mutation Protection",
-        Content = "Detects the strongest mutation from live game data, interrupts farming to collect it, "
-            .. "and checks again before banking. Best mutation bypasses Minimum Rarity.",
+        Content = "Detects the strongest live mutation, interrupts farming and checks before banking. "
+            .. "Reserves one backpack slot; best mutation bypasses Minimum Rarity.",
         Height = 68,
     })
 
