@@ -1,6 +1,6 @@
 --[[
     PuckAFK - +1 Lift Rock for Treasure
-    Smart AutoFarm v1.9.1 - Individual Luck + Mutation-Safe Pickup
+    Smart AutoFarm v1.9.2 - Live Random Mutation Guard + Safe Rerolls
 
     Built from the supplied place dump + captured remote trace for place 102555956950143.
 
@@ -78,7 +78,7 @@ if previousInstance then
 end
 
 local P = {
-    Version = "1.9.1",
+    Version = "1.9.2",
     Alive = true,
     Connections = {},
     Threads = {},
@@ -89,6 +89,10 @@ local P = {
     LastError = nil,
     LastEconomyAt = 0,
     LastSpecialSync = 0,
+    SpecialEventSerial = 0,
+    SpecialDeltaSeq = {},
+    LastMutationNotice = "",
+    LastMutationScan = 0,
     LastFreeClaim = 0,
     UI = {},
     Debug = {Entries = {}, LastStatus = "", LastStatusTime = 0, LastRouteIssue = ""},
@@ -152,6 +156,7 @@ P.Settings = {
     AutoOfflineReward = true,
     AutoGroupReward = true,
     AutoSpecialSpawns = true,
+    ProtectTopMutation = true, -- Highest live-configured mutation bypasses the rarity filter.
     IndexPriority = true,
     AdaptiveROI = true,
     PushNewStages = true,
@@ -165,7 +170,7 @@ P.Settings = {
     AutoDismissShopMenus = true, -- Restore controls when a shop popup blocks AFK farming.
     DebugConsole = true, -- Detailed tagged logs; toggle in the Debug tab.
 
-    -- 'Any' keeps highest-tier-first logic; e.g. 'Divine' skips Celestial and lower.
+    -- 'Any' allows all rarities; the top-mutation rescue can override stricter filters.
     MinPickupRarity = "Any",
 
     -- Progression requirement brain. "Required" upgrades can bypass the optional spending
@@ -1518,6 +1523,19 @@ function P:ReceiveSpecialSpawn(entry)
         return
     end
     self.Run.SpecialRevisions[stageId][slot] = newRevision
+    self.SpecialEventSerial += 1
+    self.SpecialDeltaSeq[stageId] = self.SpecialDeltaSeq[stageId] or {}
+    self.SpecialDeltaSeq[stageId][slot] = self.SpecialEventSerial
+    if type(entry.Item) == "table" and self.Settings.ProtectTopMutation
+        and self:IsTopMutation(entry.Item) then
+        local id = tostring(entry.Item.UUID or "")
+        if id ~= self.LastMutationNotice then
+            self.LastMutationNotice = id
+            self:DebugEvent("MUTATION", string.format(
+                "Top random mutation %s spotted at stage %d/%s (UUID %s)",
+                tostring(entry.Item.Variant), stageId, slot, id))
+        end
+    end
 
     if type(entry.Item) == "table" then
         self.Run.Specials[stageId][slot] = entry
@@ -1532,10 +1550,10 @@ function P:RefreshSpecialSpawns(force)
     if not self.Settings.AutoSpecialSpawns then
         return
     end
-    if not force and os.clock() - self.LastSpecialSync < 20 then
-        return
-    end
+    local age = os.clock() - self.LastSpecialSync
+    if age < (force and 0.75 or 10) then return end
     self.LastSpecialSync = os.clock()
+    local startedSerial = self.SpecialEventSerial
     local ok, result = pcall(function()
         return self.R.GetSpecialStageSpawns:InvokeServer()
     end)
@@ -1557,6 +1575,18 @@ function P:RefreshSpecialSpawns(force)
                             tonumber(self.Run.SpecialRevisions[stageId][slot]) or -math.huge,
                             revision
                         )
+                    end
+                end
+            end
+        end
+        -- An event that arrives while InvokeServer is in flight must win over
+        -- the older snapshot, including removals (revision tombstones).
+        if self.SpecialEventSerial > startedSerial then
+            for stageId, slots in pairs(self.SpecialDeltaSeq) do
+                for slot, serial in pairs(slots) do
+                    if serial > startedSerial then
+                        fresh[stageId] = fresh[stageId] or {}
+                        fresh[stageId][slot] = (self.Run.Specials[stageId] or {})[slot]
                     end
                 end
             end
@@ -1947,6 +1977,11 @@ function P:LiftStage(stageId)
         if self:IsStageCleared(stageId) then
             return true
         end
+        if self:BackpackCount() < self:BackpackCapacity()
+            and self:GetUrgentMutation(false) then
+            self:SetStatus("Top random mutation detected; collecting before lifting further", "MUTATION")
+            return false
+        end
 
         local session = self.Run.Session
         if not session or tonumber(session.StageId) ~= tonumber(stageId) then
@@ -2111,15 +2146,35 @@ function P:MinimumRarityRank()
     return (type(entry) == "table" and tonumber(entry.id)) or fallback[selected] or 0
 end
 
-function P:PickupAllowed(candidate)
-    if not candidate then
-        return false
+function P:TopMutation()
+    -- Read the game's live variant catalog, not a hard-coded Halloween/Galaxy
+    -- list: any new mutation added by an update is ranked automatically.
+    local bestName, bestMulti = nil, 1
+    for name, info in pairs(self.M.Config.Variants or {}) do
+        if type(name) == "string" and name ~= "Normal" and type(info) == "table" then
+            local multi = tonumber(info.MutationMulti)
+            if multi and multi > bestMulti and multi == multi then
+                bestName, bestMulti = name, multi
+            end
+        end
     end
-    -- This gate is authoritative for ALL pick requests, including the tutorial.
-    -- A strict Divine+ filter should never silently collect a Celestial.
-    -- New players may need to switch to Any for the mandatory tutorial pickup.
-    local selectedRank = self:MinimumRarityRank()
-    return (tonumber(candidate.RarityRank) or 0) >= selectedRank
+    return bestName, bestMulti
+end
+
+function P:IsTopMutation(item)
+    if type(item) ~= "table" then return false end
+    local name = self:TopMutation()
+    return name ~= nil and item.Variant == name
+end
+
+function P:PickupAllowed(candidate)
+    if not candidate then return false end
+    -- Protect the strongest currently configured mutation even if a saved
+    -- Divine+/Ethereal+ filter would otherwise silently discard its base tier.
+    if self.Settings.ProtectTopMutation and candidate.TopMutation then
+        return true
+    end
+    return (tonumber(candidate.RarityRank) or 0) >= self:MinimumRarityRank()
 end
 
 function P:CandidateData(stageId, slot, item, special)
@@ -2182,6 +2237,7 @@ function P:CandidateData(stageId, slot, item, special)
         Special = special == true,
         Variant = variant,
         MutationMultiplier = mutation,
+        TopMutation = self:IsTopMutation(actual),
         Rarity = rarity,
         RarityRank = rank,
         Price = price,
@@ -2225,6 +2281,14 @@ function P:GetRewardCandidates()
     end
     for stageId, isCleared in pairs(self.Run.Cleared) do
         if isCleared then
+            staged[tonumber(stageId) or stageId] = true
+        end
+    end
+    -- On some random-spawn events, the server publishes the special before
+    -- ordinary RockLiftingFeedback catches up. Include special stages only
+    -- after they have actually cleared; unbroken rocks cannot be picked up.
+    for stageId, slots in pairs(self.Run.Specials) do
+        if type(slots) == "table" and self:IsStageCleared(tonumber(stageId) or stageId) then
             staged[tonumber(stageId) or stageId] = true
         end
     end
@@ -2291,9 +2355,12 @@ function P:GetRewardCandidates()
         end
     end
 
-    -- Individual bonus is the top priority; rarity, mutation and price are
-    -- tiebreakers only. The minimum-rarity setting remains a hard filter.
+    -- An event-limited strongest mutation must never be crowded out by ordinary
+    -- loot. Otherwise retain the v1.9.1 individual-luck-first ordering.
     table.sort(candidates, function(a, b)
+        if self.Settings.ProtectTopMutation and a.TopMutation ~= b.TopMutation then
+            return a.TopMutation == true
+        end
         if a.Luck ~= b.Luck then return a.Luck > b.Luck end
         if a.RarityRank ~= b.RarityRank then return a.RarityRank > b.RarityRank end
         if a.MutationMultiplier ~= b.MutationMultiplier then
@@ -2306,6 +2373,31 @@ function P:GetRewardCandidates()
         return tostring(a.Slot) < tostring(b.Slot)
     end)
     return candidates
+end
+
+function P:GetUrgentMutation(force)
+    if not self.Settings.ProtectTopMutation or not self.Settings.AutoCollect then
+        return nil
+    end
+    if not force and os.clock() - self.LastMutationScan < 0.22 then
+        return nil
+    end
+    self.LastMutationScan = os.clock()
+    -- Fully re-rank snapshots + visible UUIDs; do not trust a stale candidate
+    -- held across asynchronous stages or between pickup requests.
+    local best = self:GetRewardCandidates()[1]
+    if best and best.TopMutation then
+        local id = tostring(best.Item.UUID or "")
+        if id ~= self.LastMutationNotice then
+            self.LastMutationNotice = id
+            self:DebugEvent("MUTATION", string.format(
+                "Best mutation available: %s %s +%.1f%% Luck at Stage %d",
+                tostring(best.Variant), tostring(best.Item.Key),
+                (tonumber(best.Luck) or 0) * 100, best.StageId))
+        end
+        return best
+    end
+    return nil
 end
 
 function P:CollectCandidate(candidate)
@@ -2352,10 +2444,17 @@ function P:CollectCandidate(candidate)
 
     -- HARD CHECK: even if rarity/config changed during travel or a snapshot was
     -- stale, do not send a pickup request for anything below the selected tier.
-    local currentRank, currentRarity = self:RarityRank(visible or candidate.Item)
-    if not self:PickupAllowed({RarityRank = currentRank}) then
+    -- Rebuild from the most recent grounded item so the mutation exception is
+    -- applied identically during selection and at the final pickup request.
+    local lastItem = visible or refreshed.Item
+    local check = self:CandidateData(candidate.StageId, candidate.Slot, lastItem, refreshed.Special)
+    if not self:PickupAllowed(check) then
         self.LastError = string.format("Skipped %s treasure (minimum %s)",
-            tostring(currentRarity), tostring(self.Settings.MinPickupRarity or "Any"))
+            tostring(check.Rarity), tostring(self.Settings.MinPickupRarity or "Any"))
+        return false
+    end
+    if check.Variant ~= candidate.Variant then
+        self:DebugEvent("MUTATION", "Slot changed mutation during pickup; re-ranking live items")
         return false
     end
 
@@ -2469,6 +2568,16 @@ end
 
 function P:BankRun()
     if not self.Settings.AutoBank then return false end
+    -- Entering SpawnZone destroys every still-uncollected stage reward.
+    -- Force a fresh priority check before irreversible banking, without
+    -- freezing progression if the backpack is already completely full.
+    if self:BackpackCount() < self:BackpackCapacity() then
+        self:RefreshSpecialSpawns(true)
+        if self:GetUrgentMutation(true) then
+            self:SetStatus("Bank postponed: best mutation still waiting to be picked up", "MUTATION")
+            return false
+        end
+    end
     local previousReset=self.Run.LastReset
     local previousBank=self.Run.LastBank
     local clearedBefore=self:HighestCleared()
@@ -3178,6 +3287,18 @@ function P:RunProgressionCycle()
     -- A fresh injection can race the server snapshot. Synchronize before deciding that a partial
     -- backpack has no live run behind it, otherwise entering SpawnZone could erase recoverable rewards.
     self:EnsureRunSynced()
+    if self.Settings.ProtectTopMutation and self.Settings.AutoCollect
+        and self:BackpackCount() < self:BackpackCapacity() then
+        local urgent = self:GetUrgentMutation(true)
+        if urgent then
+            self:SetStatus("Rescuing top random mutation before next progression step", "MUTATION")
+            if not self:CollectCandidate(urgent) then
+                self:RefreshSpecialSpawns(true)
+                task.wait(0.18)
+            end
+            return
+        end
+    end
 
     local backpackCount = self:BackpackCount()
     local capacity = self:BackpackCapacity()
@@ -3247,6 +3368,13 @@ function P:RunProgressionCycle()
             end
             local lifted = self:LiftStage(stageId)
             if not lifted then
+                break
+            end
+            -- A mutation can spawn immediately after a rock clears. Claim it
+            -- before advancing through every remaining stage.
+            if self:BackpackCount() < self:BackpackCapacity()
+                and self:GetUrgentMutation(true) then
+                self:SetStatus("Top mutation found after lift; interrupting stage route", "MUTATION")
                 break
             end
             stageId = stageId + 1
@@ -3539,6 +3667,13 @@ function P:CreateUI()
     bindToggle(farm, "Auto Collect Treasure", "AutoCollect", stopWhenDisabled)
     bindToggle(farm, "Auto Bank Treasure", "AutoBank", stopWhenDisabled)
     bindToggle(farm, "Auto Special Treasure", "AutoSpecialSpawns")
+    bindToggle(farm, "Never Skip Best Mutation", "ProtectTopMutation")
+    farm:CreateParagraph({
+        Title = "Random Mutation Protection",
+        Content = "Detects the strongest mutation from live game data, interrupts farming to collect it, "
+            .. "and checks again before banking. Best mutation bypasses Minimum Rarity.",
+        Height = 68,
+    })
 
     farm:CreateSection("Smart Choices")
     bindToggle(farm, "Smart Stage Selection", "AdaptiveROI")
@@ -3572,7 +3707,7 @@ function P:CreateUI()
     })
     farm:CreateParagraph({
         Title = "Rarity Filter",
-        Content = "Only collect the chosen rarity OR higher. Divine skips Celestial. "
+        Content = "Only collect the chosen rarity OR higher (except strongest mutation when protection is on). "
             .. "If none appear, Auto Bank resets the run to try again. "
             .. "Set Any for the mandatory tutorial pickup.",
         Height = 68,
